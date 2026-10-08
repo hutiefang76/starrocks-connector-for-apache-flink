@@ -148,16 +148,9 @@ public class StreamLoadTableProperties implements Serializable {
 
         }
 
-        // This function does not copy the uniqueKey and properties attributes because the uniqueKey 
-        // is generated in the StreamLoadTableProperties constructor.
-        // The properties only contains three elements(database,table,columns), which are automatically
-        // populated during the build process.
-        // TODO: StreamLoadProperties.headers hold properties common to multiple tables, while
-        // StreamLoadTableProperties.properties hold the specific properties of an individual table.
-        // This should be taken into consideration during the refactoring.
+        // uniqueKey is not copied: it is generated from database and table, and build() writes this
+        // builder's own database and table into the properties, so the copy names its own table.
         public Builder copyFrom(StreamLoadTableProperties streamLoadTableProperties) {
-            // TODO: datbase, table, columns are private propertis for an individual table.
-            // We may not copy thers private propertis.
             database(streamLoadTableProperties.getDatabase());
             table(streamLoadTableProperties.getTable());
             columns(streamLoadTableProperties.getColumns());
@@ -165,6 +158,9 @@ public class StreamLoadTableProperties implements Serializable {
             chunkLimit(streamLoadTableProperties.getChunkLimit());
             maxBufferRows(streamLoadTableProperties.getMaxBufferRows());
             tableProperties.putAll(streamLoadTableProperties.getTableProperties());
+            // The properties map holds the per table stream load headers, and nothing re-derives
+            // them, so a copy that drops them would write the table differently.
+            properties.putAll(streamLoadTableProperties.getProperties());
             commonProperties.putAll(streamLoadTableProperties.getCommonProperties());
             return this;
         }

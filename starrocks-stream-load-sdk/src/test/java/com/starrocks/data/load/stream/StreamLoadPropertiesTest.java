@@ -22,8 +22,11 @@ import com.starrocks.data.load.stream.properties.StreamLoadProperties;
 import com.starrocks.data.load.stream.properties.StreamLoadTableProperties;
 import org.junit.Test;
 
+import java.util.Collections;
+
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
 
 public class StreamLoadPropertiesTest {
 
@@ -151,5 +154,92 @@ public class StreamLoadPropertiesTest {
                 .build();
 
         assertEquals(10000, props.getPublishTimeoutMs());
+    }
+
+    // Expanding a wildcard default onto a concrete table must keep the headers added to the default.
+    @Test
+    public void testExpandingWildcardDefaultKeepsAddedProperties() {
+        StreamLoadTableProperties wildcardDefault = StreamLoadTableProperties.builder()
+                .database("*")
+                .table("*")
+                .addProperty("format", "json")
+                .addProperty("strip_outer_array", "true")
+                .addProperty("partial_update", "true")
+                .addCommonProperties(Collections.singletonMap("timeout", "60"))
+                .build();
+        StreamLoadProperties props = createBaseBuilder().defaultTableProperties(wildcardDefault).build();
+
+        StreamLoadTableProperties expanded = props.getTableProperties("db-t", "db", "t");
+
+        assertEquals("json", expanded.getProperty("format").orElse(null));
+        assertEquals("true", expanded.getProperty("strip_outer_array").orElse(null));
+        assertEquals("true", expanded.getProperty("partial_update").orElse(null));
+        assertEquals("60", expanded.getProperty("timeout").orElse(null));
+        assertEquals("60", expanded.getCommonProperties().get("timeout"));
+    }
+
+    @Test
+    public void testExpandedDefaultBelongsToTheDestinationTable() {
+        StreamLoadTableProperties wildcardDefault = StreamLoadTableProperties.builder()
+                .database("*")
+                .table("*")
+                .addProperty("format", "json")
+                .build();
+        StreamLoadProperties props = createBaseBuilder().defaultTableProperties(wildcardDefault).build();
+
+        StreamLoadTableProperties expanded = props.getTableProperties("db-t", "db", "t");
+
+        assertEquals("db", expanded.getDatabase());
+        assertEquals("t", expanded.getTable());
+        // build() writes this builder's own db/table over the copied ones.
+        assertEquals("db", expanded.getProperty("db").orElse(null));
+        assertEquals("t", expanded.getProperty("table").orElse(null));
+        assertEquals(StreamLoadUtils.getTableUniqueKey("db", "t"), expanded.getUniqueKey());
+        assertFalse(wildcardDefault.getUniqueKey().equals(expanded.getUniqueKey()));
+    }
+
+    @Test
+    public void testCopiedColumnsPropertyIsOverriddenByBuilderColumns() {
+        StreamLoadTableProperties wildcardDefault = StreamLoadTableProperties.builder()
+                .database("*")
+                .table("*")
+                .addProperty("columns", "`a`,`b`")
+                .build();
+        StreamLoadProperties props = createBaseBuilder().defaultTableProperties(wildcardDefault).build();
+
+        StreamLoadTableProperties expanded = props.getTableProperties("db-t", "db", "t");
+        assertEquals("`a`,`b`", expanded.getProperty("columns").orElse(null));
+        assertNull(expanded.getColumns());
+
+        StreamLoadTableProperties overridden = StreamLoadTableProperties.builder()
+                .copyFrom(wildcardDefault)
+                .database("db")
+                .table("t")
+                .columns("`c`")
+                .build();
+        assertEquals("`c`", overridden.getColumns());
+        assertEquals("`c`", overridden.getProperty("columns").orElse(null));
+        assertEquals("db", overridden.getProperty("db").orElse(null));
+        assertEquals("t", overridden.getProperty("table").orElse(null));
+    }
+
+    @Test
+    public void testCopyFromDoesNotShareMapsWithTheSource() {
+        StreamLoadTableProperties source = StreamLoadTableProperties.builder()
+                .database("db")
+                .table("src")
+                .addProperty("format", "json")
+                .build();
+        StreamLoadTableProperties.Builder builder = StreamLoadTableProperties.builder().copyFrom(source);
+
+        source.getProperties().put("format", "csv");
+        source.getProperties().put("added-later", "true");
+        source.getTableProperties().put("added-later", "true");
+
+        StreamLoadTableProperties copy = builder.database("db").table("dst").build();
+        assertEquals("json", copy.getProperty("format").orElse(null));
+        assertNull(copy.getProperty("added-later").orElse(null));
+        assertFalse(copy.getTableProperties().containsKey("added-later"));
+        assertEquals("csv", source.getProperty("format").orElse(null));
     }
 }
