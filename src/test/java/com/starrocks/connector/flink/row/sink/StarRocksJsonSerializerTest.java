@@ -22,7 +22,9 @@ import com.starrocks.connector.flink.tools.JsonWrapper;
 import org.junit.Test;
 
 import java.io.IOException;
+import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
+import java.sql.Timestamp;
 import java.time.LocalDate;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -38,11 +40,13 @@ import static org.junit.Assert.assertTrue;
 
 import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.api.TableSchema;
+import org.apache.flink.table.data.DecimalData;
 import org.apache.flink.table.data.GenericArrayData;
 import org.apache.flink.table.data.GenericMapData;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.MapData;
 import org.apache.flink.table.data.StringData;
+import org.apache.flink.table.data.TimestampData;
 import org.apache.flink.table.runtime.typeutils.MapDataSerializer;
 import org.apache.flink.table.types.DataType;
 
@@ -185,6 +189,73 @@ public class StarRocksJsonSerializerTest extends StarRocksSinkBaseTest {
         JSONObject m4Json = (JSONObject) rMap.get("m4");
         assertNotNull("unexpected json: " + result, m4Json);
         assertEquals("unexpected json: " + result, 0, m4Json.size());
+    }
+
+    /**
+     * A map key is the field name of a json object, so a key which is not a string must be written
+     * as a quoted string: fastjson writes the raw value of a non-string key, and the parser of
+     * fastjson is lenient, so the raw json must be asserted here.
+     */
+    @Test
+    @SuppressWarnings("unchecked")
+    public void testNestedNonStringMapKeySerialize() {
+        TableSchema schema = TableSchema.builder()
+            .field("mi", DataTypes.MAP(DataTypes.INT(), DataTypes.STRING()))
+            .field("md", DataTypes.MAP(DataTypes.DECIMAL(10, 2), DataTypes.STRING()))
+            .field("mdt", DataTypes.MAP(DataTypes.DATE(), DataTypes.STRING()))
+            .field("mts", DataTypes.MAP(DataTypes.TIMESTAMP(3), DataTypes.STRING()))
+            .build();
+        assertNonStringMapKeyJson(schema, createNonStringMapKeyRowData(false));
+        assertNonStringMapKeyJson(schema, createNonStringMapKeyRowData(true));
+    }
+
+    private GenericRowData createNonStringMapKeyRowData(boolean binary) {
+        GenericRowData rowData = new GenericRowData(4);
+
+        Map<Object, Object> mi = new HashMap<>();
+        mi.put(1, StringData.fromString("v"));
+        rowData.setField(0, binary
+            ? toBinaryMap(mi, DataTypes.INT(), DataTypes.STRING()) : new GenericMapData(mi));
+
+        Map<Object, Object> md = new HashMap<>();
+        md.put(DecimalData.fromBigDecimal(new BigDecimal("1.50"), 10, 2), StringData.fromString("v"));
+        rowData.setField(1, binary
+            ? toBinaryMap(md, DataTypes.DECIMAL(10, 2), DataTypes.STRING()) : new GenericMapData(md));
+
+        Map<Object, Object> mdt = new HashMap<>();
+        mdt.put((int) LocalDate.of(2021, 1, 2).toEpochDay(), StringData.fromString("v"));
+        rowData.setField(2, binary
+            ? toBinaryMap(mdt, DataTypes.DATE(), DataTypes.STRING()) : new GenericMapData(mdt));
+
+        Map<Object, Object> mts = new HashMap<>();
+        mts.put(TimestampData.fromTimestamp(Timestamp.valueOf("2021-01-02 03:04:05.006")),
+            StringData.fromString("v"));
+        rowData.setField(3, binary
+            ? toBinaryMap(mts, DataTypes.TIMESTAMP(3), DataTypes.STRING()) : new GenericMapData(mts));
+
+        return rowData;
+    }
+
+    @SuppressWarnings("unchecked")
+    private void assertNonStringMapKeyJson(TableSchema schema, GenericRowData rowData) {
+        String result = serializeRow(schema, rowData);
+        // a non-string key which is not converted to a string is written without quotes
+        assertFalse("unexpected json: " + result, result.contains("{1:"));
+        assertTrue("unexpected json: " + result, result.contains("\"mi\":{\"1\":\"v\"}"));
+
+        Map<String, Object> rMap = (Map<String, Object>)JSON.parse(result);
+        assertEquals("unexpected json: " + result, "v", mapValue(rMap.get("mi"), "1"));
+        assertEquals("unexpected json: " + result, "v", mapValue(rMap.get("md"), "1.50"));
+        assertEquals("unexpected json: " + result, "v", mapValue(rMap.get("mdt"), "2021-01-02"));
+        assertEquals("unexpected json: " + result, "v", mapValue(rMap.get("mts"), "2021-01-02T03:04:05.006"));
+    }
+
+    private String mapValue(Object map, String key) {
+        JSONObject json = (JSONObject) map;
+        assertNotNull("unexpected value: " + map, json);
+        assertEquals(1, json.size());
+        assertTrue("unexpected key of " + json, json.containsKey(key));
+        return json.getString(key);
     }
 
     private static MapData toBinaryMap(Map<Object, Object> map, DataType keyType, DataType valueType) {

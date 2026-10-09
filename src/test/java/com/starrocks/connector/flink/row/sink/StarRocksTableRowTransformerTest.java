@@ -34,10 +34,14 @@ import java.util.List;
 import java.util.Map;
 
 import com.alibaba.fastjson.JSON;
+import com.alibaba.fastjson.JSONObject;
 import com.starrocks.connector.flink.StarRocksSinkBaseTest;
+import com.starrocks.connector.flink.table.StarRocksDataType;
+import com.starrocks.connector.flink.tools.JsonWrapper;
 
 import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.api.TableSchema;
+import org.apache.flink.table.data.ArrayData;
 import org.apache.flink.table.data.DecimalData;
 import org.apache.flink.table.data.GenericArrayData;
 import org.apache.flink.table.data.GenericMapData;
@@ -46,7 +50,9 @@ import org.apache.flink.table.data.MapData;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.data.StringData;
 import org.apache.flink.table.data.TimestampData;
+import org.apache.flink.table.runtime.typeutils.ArrayDataSerializer;
 import org.apache.flink.table.runtime.typeutils.MapDataSerializer;
+import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.LogicalTypeRoot;
 import org.apache.flink.table.types.logical.MapType;
@@ -61,6 +67,32 @@ public class StarRocksTableRowTransformerTest extends StarRocksSinkBaseTest {
         .field("m3", DataTypes.MAP(DataTypes.STRING(), DataTypes.DATE()))
         .field("m4", DataTypes.MAP(DataTypes.STRING(), DataTypes.STRING()))
         .field("a1", DataTypes.ARRAY(DataTypes.STRING()))
+        .build();
+
+    private static final Timestamp NESTED_MAP_TIMESTAMP = Timestamp.valueOf("2021-01-02 03:04:05.006");
+
+    private static final DataType NESTED_MAP_ROW_TYPE = DataTypes.ROW(
+        DataTypes.FIELD("a", DataTypes.INT()), DataTypes.FIELD("b", DataTypes.STRING()));
+
+    private static final TableSchema NON_STRING_MAP_KEY_SCHEMA = TableSchema.builder()
+        .field("mi", DataTypes.MAP(DataTypes.INT(), DataTypes.STRING()))
+        .field("md", DataTypes.MAP(DataTypes.DECIMAL(10, 2), DataTypes.STRING()))
+        .field("mdt", DataTypes.MAP(DataTypes.DATE(), DataTypes.STRING()))
+        .field("mts", DataTypes.MAP(DataTypes.TIMESTAMP(3), DataTypes.STRING()))
+        .build();
+
+    private static final TableSchema NESTED_ROW_VALUE_SCHEMA = TableSchema.builder()
+        .field("m", DataTypes.MAP(DataTypes.STRING(), NESTED_MAP_ROW_TYPE))
+        .build();
+
+    private static final TableSchema NESTED_ROW_ARRAY_SCHEMA = TableSchema.builder()
+        .field("a", DataTypes.ARRAY(NESTED_MAP_ROW_TYPE))
+        .build();
+
+    private static final TableSchema TOP_LEVEL_ROW_SCHEMA = TableSchema.builder()
+        .field("r", NESTED_MAP_ROW_TYPE)
+        .field("j", DataTypes.STRING())
+        .field("s", DataTypes.STRING())
         .build();
 
     @SuppressWarnings("unchecked")
@@ -200,6 +232,185 @@ public class StarRocksTableRowTransformerTest extends StarRocksSinkBaseTest {
         assertEquals(2, a1.size());
         assertEquals(StringData.fromString("p"), a1.get(0));
         assertNull(a1.get(1));
+    }
+
+    /**
+     * The key of a map is the field name of a json object, so it must be a string even if the key
+     * type is not a string type: fastjson writes a non-string key without quotes.
+     */
+    @Test
+    public void testNestedMapNonStringKeysTransformer() {
+        assertNestedMapKeyStrings(createTransformer(NON_STRING_MAP_KEY_SCHEMA, StarRocksDataType.JSON)
+            .transform(createNonStringMapKeyRowData(false), false));
+        assertNestedMapKeyStrings(createTransformer(NON_STRING_MAP_KEY_SCHEMA, StarRocksDataType.JSON)
+            .transform(createNonStringMapKeyRowData(true), false));
+    }
+
+    private GenericRowData createNonStringMapKeyRowData(boolean binary) {
+        DataType[] mapTypes = NON_STRING_MAP_KEY_SCHEMA.getFieldDataTypes();
+        GenericRowData rowData = new GenericRowData(NON_STRING_MAP_KEY_SCHEMA.getFieldCount());
+
+        Map<Object, Object> mi = new HashMap<>();
+        mi.put(1, StringData.fromString("v"));
+        rowData.setField(0, binary ? toBinaryMap(mi, mapTypes[0]) : new GenericMapData(mi));
+
+        Map<Object, Object> md = new HashMap<>();
+        md.put(DecimalData.fromBigDecimal(new BigDecimal("1.50"), 10, 2), StringData.fromString("v"));
+        rowData.setField(1, binary ? toBinaryMap(md, mapTypes[1]) : new GenericMapData(md));
+
+        Map<Object, Object> mdt = new HashMap<>();
+        mdt.put((int) NESTED_MAP_DATE.toEpochDay(), StringData.fromString("v"));
+        rowData.setField(2, binary ? toBinaryMap(mdt, mapTypes[2]) : new GenericMapData(mdt));
+
+        Map<Object, Object> mts = new HashMap<>();
+        mts.put(TimestampData.fromTimestamp(NESTED_MAP_TIMESTAMP), StringData.fromString("v"));
+        rowData.setField(3, binary ? toBinaryMap(mts, mapTypes[3]) : new GenericMapData(mts));
+
+        return rowData;
+    }
+
+    @SuppressWarnings("unchecked")
+    private void assertNestedMapKeyStrings(Object[] values) {
+        assertEquals("1", assertSingleStringKey(values[0]));
+        assertEquals("1.50", assertSingleStringKey(values[1]));
+        assertEquals(NESTED_MAP_DATE.toString(), assertSingleStringKey(values[2]));
+        assertEquals("2021-01-02T03:04:05.006", assertSingleStringKey(values[3]));
+    }
+
+    @SuppressWarnings("unchecked")
+    private String assertSingleStringKey(Object value) {
+        Map<Object, Object> map = (Map<Object, Object>) value;
+        assertEquals(1, map.size());
+        Object key = map.keySet().iterator().next();
+        // a key which is not a string is written by fastjson without quotes
+        assertTrue("unexpected key: " + key, key instanceof String);
+        assertEquals("v", map.get(key));
+        return (String) key;
+    }
+
+    /**
+     * The metadata of the starrocks columns is only known for the top level columns, so the fields
+     * of a nested row must be converted without looking up that metadata.
+     */
+    @Test
+    public void testNestedRowValueWithColumnMetadataTransformer() {
+        assertNestedRowValues(createTransformer(NESTED_ROW_VALUE_SCHEMA, StarRocksDataType.JSON)
+            .transform(createNestedRowValueRowData(false), false));
+        assertNestedRowValues(createTransformer(NESTED_ROW_VALUE_SCHEMA, StarRocksDataType.JSON)
+            .transform(createNestedRowValueRowData(true), false));
+    }
+
+    private GenericRowData createNestedRowValueRowData(boolean binary) {
+        GenericRowData rowData = new GenericRowData(NESTED_ROW_VALUE_SCHEMA.getFieldCount());
+        Map<Object, Object> m = new HashMap<>();
+        m.put(StringData.fromString("r"), createNestedRow());
+        rowData.setField(0, binary
+            ? toBinaryMap(m, NESTED_ROW_VALUE_SCHEMA.getFieldDataTypes()[0])
+            : new GenericMapData(m));
+        return rowData;
+    }
+
+    @SuppressWarnings("unchecked")
+    private void assertNestedRowValues(Object[] values) {
+        Map<Object, Object> m = (Map<Object, Object>) values[0];
+        assertEquals(1, m.size());
+        Map<String, Object> row = (Map<String, Object>) m.get("r");
+        assertNotNull(row);
+        assertEquals(7, ((Number) row.get("a")).intValue());
+        // the field of the nested row must not be converted with the metadata of a top level column
+        assertTrue("unexpected value: " + row.get("b"), row.get("b") instanceof String);
+        assertEquals("{\"x\":1}", row.get("b"));
+    }
+
+    /**
+     * The elements of a binary array of rows are serialized as json strings, and the metadata of
+     * the top level column must not be applied to the fields of the nested rows.
+     */
+    @Test
+    @SuppressWarnings("unchecked")
+    public void testArrayRowValueWithColumnMetadataTransformer() {
+        StarRocksTableRowTransformer rowTransformer =
+            createTransformer(NESTED_ROW_ARRAY_SCHEMA, StarRocksDataType.JSON);
+        ArrayData arrayData = new ArrayDataSerializer(NESTED_MAP_ROW_TYPE.getLogicalType())
+            .toBinaryArray(new GenericArrayData(new Object[]{createNestedRow(), null}));
+        GenericRowData rowData = new GenericRowData(NESTED_ROW_ARRAY_SCHEMA.getFieldCount());
+        rowData.setField(0, arrayData);
+
+        List<Object> elements = (List<Object>) rowTransformer.transform(rowData, false)[0];
+        assertEquals(2, elements.size());
+        // the row element is serialized as a json string
+        assertTrue("unexpected element: " + elements.get(0), elements.get(0) instanceof String);
+        JSONObject rowJson = JSON.parseObject((String) elements.get(0));
+        assertEquals(7, rowJson.getIntValue("a"));
+        // the field of the nested row must not be converted with the metadata of the top level column
+        assertTrue("unexpected value: " + rowJson.get("b"), rowJson.get("b") instanceof String);
+        assertEquals("{\"x\":1}", rowJson.get("b"));
+        // the null element of the nested array must be kept as null
+        assertNull(elements.get(1));
+    }
+
+    /**
+     * The metadata of a top level column must keep its behaviour: a row column whose metadata is a
+     * string is serialized to a json string, a json string column is parsed, and a string column
+     * whose metadata is not a json is kept as a string.
+     */
+    @Test
+    public void testTopLevelRowColumnWithMetadataTransformer() {
+        StarRocksTableRowTransformer rowTransformer =
+            createTransformer(TOP_LEVEL_ROW_SCHEMA, null);
+        Map<String, StarRocksDataType> columns = new HashMap<>();
+        columns.put("r", StarRocksDataType.STRING);
+        columns.put("j", StarRocksDataType.JSON);
+        columns.put("s", StarRocksDataType.VARCHAR);
+        rowTransformer.setStarRocksColumns(columns);
+
+        GenericRowData rowData = new GenericRowData(TOP_LEVEL_ROW_SCHEMA.getFieldCount());
+        rowData.setField(0, createNestedRow());
+        rowData.setField(1, StringData.fromString("{\"x\":1}"));
+        rowData.setField(2, StringData.fromString("{\"x\":1}"));
+
+        Object[] values = rowTransformer.transform(rowData, false);
+        // a row column whose metadata is `string` is serialized to a json string
+        assertTrue("unexpected value: " + values[0], values[0] instanceof String);
+        JSONObject rJson = JSON.parseObject((String) values[0]);
+        assertEquals(7, rJson.getIntValue("a"));
+        // the field of the top level row must not be converted with the metadata of another column
+        assertTrue("unexpected value: " + rJson.get("b"), rJson.get("b") instanceof String);
+        assertEquals("{\"x\":1}", rJson.get("b"));
+        // a string column whose metadata is `json` is parsed to a json object
+        assertTrue("unexpected value: " + values[1], values[1] instanceof JSONObject);
+        assertEquals(1, ((JSONObject) values[1]).getIntValue("x"));
+        // a string column whose metadata is not a json is kept as a string
+        assertEquals("{\"x\":1}", values[2]);
+    }
+
+    private StarRocksTableRowTransformer createTransformer(TableSchema schema, StarRocksDataType columnType) {
+        StarRocksTableRowTransformer rowTransformer = new StarRocksTableRowTransformer(null);
+        rowTransformer.setRuntimeContext(null);
+        rowTransformer.setTableSchema(schema);
+        rowTransformer.setFastJsonWrapper(new JsonWrapper());
+        if (columnType != null) {
+            // the sink always provides the metadata of the starrocks columns
+            Map<String, StarRocksDataType> columns = new HashMap<>();
+            for (String name : schema.getFieldNames()) {
+                columns.put(name, columnType);
+            }
+            rowTransformer.setStarRocksColumns(columns);
+        }
+        return rowTransformer;
+    }
+
+    private GenericRowData createNestedRow() {
+        GenericRowData row = new GenericRowData(NESTED_MAP_ROW_TYPE.getLogicalType().getChildren().size());
+        row.setField(0, 7);
+        row.setField(1, StringData.fromString("{\"x\":1}"));
+        return row;
+    }
+
+    private static MapData toBinaryMap(Map<Object, Object> map, DataType mapDataType) {
+        MapType mapType = (MapType) mapDataType.getLogicalType();
+        return new MapDataSerializer(mapType.getKeyType(), mapType.getValueType())
+            .toBinaryMap(new GenericMapData(map));
     }
 
     private GenericRowData createRowData() {

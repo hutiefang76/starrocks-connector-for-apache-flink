@@ -102,6 +102,15 @@ public class StarRocksTableRowTransformer implements StarRocksIRowTransformer<Ro
     }
 
     private Object typeConvertion(LogicalType type, RowData record, int pos) {
+        return typeConvertion(type, record, pos, true);
+    }
+
+    /**
+     * Convert the value at the given position of a row. Only a top level position may look up the
+     * metadata (json/string) of the starrocks columns, because the position of a nested field is
+     * relative to its own nested row.
+     */
+    private Object typeConvertion(LogicalType type, RowData record, int pos, boolean topLevel) {
         if (record.isNullAt(pos)) {
             return null;
         }
@@ -123,7 +132,7 @@ public class StarRocksTableRowTransformer implements StarRocksIRowTransformer<Ro
             case CHAR:
             case VARCHAR:
                 String sValue = record.getString(pos).toString();
-                if (columns == null) {
+                if (!topLevel || columns == null) {
                     return sValue;
                 }
                 StarRocksDataType starRocksDataType =
@@ -165,10 +174,8 @@ public class StarRocksTableRowTransformer implements StarRocksIRowTransformer<Ro
                 return convertNestedMap(record.getMap(pos), type);
             case ROW:
                 RowType rType = (RowType)type;
-                Map<String, Object> m = new HashMap<>();
-                RowData row = record.getRow(pos, rType.getFieldCount());
-                rType.getFields().parallelStream().forEach(f -> m.put(f.getName(), typeConvertion(f.getType(), row, rType.getFieldIndex(f.getName()))));
-                if (columns == null) {
+                Map<String, Object> m = convertNestedRow(record.getRow(pos, rType.getFieldCount()), rType);
+                if (!topLevel || columns == null) {
                     return m;
                 }
                 StarRocksDataType rStarRocksDataType =
@@ -197,9 +204,7 @@ public class StarRocksTableRowTransformer implements StarRocksIRowTransformer<Ro
                         // the null element of the nested array must be kept as null
                         return null;
                     }
-                    Map<String, Object> m = Maps.newHashMap();
-                    rType.getFields().parallelStream().forEach(f -> m.put(f.getName(), typeConvertion(f.getType(), (RowData)row, rType.getFieldIndex(f.getName()))));
-                    return jsonWrapper.toJSONString(m);
+                    return jsonWrapper.toJSONString(convertNestedRow((RowData)row, rType));
                 }).collect(Collectors.toList());
             }
             if (LogicalTypeRoot.MAP.equals(lt.getTypeRoot())) {
@@ -225,19 +230,49 @@ public class StarRocksTableRowTransformer implements StarRocksIRowTransformer<Ro
         ArrayData valueArray = mapData.valueArray();
         Map<Object, Object> result = Maps.newHashMap();
         for (int i = 0; i < mapData.size(); i++) {
-            // the value of a map is allowed to be null, and the null value must be kept as null
-            // instead of being traversed as a nested map/array
-            result.put(convertNestedElement(keyArray, i, keyType), convertNestedElement(valueArray, i, valueType));
+            // The key must be a string: fastjson writes a key which is not a string without
+            // quotes, and the produced json object is rejected by StarRocks. A null value is kept
+            // as null instead of being traversed as a nested map/array.
+            result.put(convertNestedMapKey(keyArray, i, keyType), convertNestedElement(valueArray, i, valueType));
         }
         return result;
     }
 
     /**
-     * Convert a single element of a nested map or array, the element is converted to a plain
-     * java object according to its logical type, and a null element is kept as null. It is needed
-     * because the internal types like StringData can not be serialized correctly here: the keys
-     * of a map are serialized by the global serialize config of fastjson, and the values of a map
-     * would be passed to the json serializer as they are.
+     * Convert the key of a nested map to the string which is used as the field name of the json
+     * object, formatted in the same way as the map values so that the keys do not depend on the
+     * serializers of fastjson.
+     */
+    private Object convertNestedMapKey(ArrayData keyArray, int pos, LogicalType keyType) {
+        if (keyArray.isNullAt(pos)) {
+            return null;
+        }
+        switch (keyType.getTypeRoot()) {
+            case CHAR:
+            case VARCHAR:
+                return keyArray.getString(pos).toString();
+            case DATE:
+                return dateFormatter.format(Date.valueOf(LocalDate.ofEpochDay(keyArray.getInt(pos))));
+            case DECIMAL:
+                final DecimalType keyDecimalType = (DecimalType) keyType;
+                return keyArray.getDecimal(pos, keyDecimalType.getPrecision(), keyDecimalType.getScale())
+                        .toBigDecimal().toPlainString();
+            case TIMESTAMP_WITHOUT_TIME_ZONE:
+                return keyArray.getTimestamp(pos, ((TimestampType) keyType).getPrecision())
+                        .toLocalDateTime().toString();
+            case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
+                return keyArray.getTimestamp(pos, ((LocalZonedTimestampType) keyType).getPrecision())
+                        .toLocalDateTime().toString();
+            default:
+                return String.valueOf(convertNestedElement(keyArray, pos, keyType));
+        }
+    }
+
+    /**
+     * Convert a single element of a nested map or array to a plain java object according to its
+     * logical type, because the internal types like StringData can not be serialized correctly
+     * as the values of a map are passed to the json serializer as they are. A null element is
+     * kept as null.
      */
     private Object convertNestedElement(ArrayData arrayData, int pos, LogicalType type) {
         if (arrayData.isNullAt(pos)) {
@@ -255,15 +290,23 @@ public class StarRocksTableRowTransformer implements StarRocksIRowTransformer<Ro
                 return convertNestedArray(arrayData.getArray(pos), type);
             case ROW:
                 RowType rType = (RowType)type;
-                RowData row = arrayData.getRow(pos, rType.getFieldCount());
-                Map<String, Object> m = new HashMap<>();
-                for (RowType.RowField field : rType.getFields()) {
-                    m.put(field.getName(), typeConvertion(field.getType(), row, rType.getFieldIndex(field.getName())));
-                }
-                return m;
+                return convertNestedRow(arrayData.getRow(pos, rType.getFieldCount()), rType);
             default:
                 return ArrayData.createElementGetter(type).getElementOrNull(arrayData, pos);
         }
+    }
+
+    /**
+     * Convert the fields of a nested row to a plain map. The position of a nested field is
+     * relative to its own nested row, so the conversion must not look up the metadata of the top
+     * level columns: it would apply the metadata of another column, or be out of range.
+     */
+    private Map<String, Object> convertNestedRow(RowData row, RowType rowType) {
+        Map<String, Object> m = new HashMap<>();
+        for (RowType.RowField field : rowType.getFields()) {
+            m.put(field.getName(), typeConvertion(field.getType(), row, rowType.getFieldIndex(field.getName()), false));
+        }
+        return m;
     }
     
 }
