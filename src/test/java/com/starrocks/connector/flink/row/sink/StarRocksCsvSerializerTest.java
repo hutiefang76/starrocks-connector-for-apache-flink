@@ -291,4 +291,98 @@ public class StarRocksCsvSerializerTest extends StarRocksSinkBaseTest {
         }
         return properties;
     }
+
+    @Test
+    public void testMergeCommitEntryOfThisTableThatOmitsAGlobalDialectHeaderIsRejected() {
+        // Merge commit builds the headers of one table from the entry of that table alone, so a
+        // header the entry leaves out is not sent and the server parses the bytes with its own
+        // default, while the serializer wrote the sink level value.
+        assertMergeCommitMissingHeaderRejected("enclose", "'");
+        assertMergeCommitMissingHeaderRejected("escape", "\\");
+        assertMergeCommitMissingHeaderRejected("column_separator", "\\x01");
+        assertMergeCommitMissingHeaderRejected("row_delimiter", "\\x02");
+    }
+
+    @Test
+    public void testMergeCommitEntryOfThisTableThatSetsTheSameDialectIsAccepted() {
+        Map<String, String> globals = props(
+                "enable_merge_commit", "true",
+                "merge_commit_interval_ms", "1000",
+                "column_separator", "\\x01",
+                "row_delimiter", "\\x02",
+                "enclose", "'",
+                "escape", "\\");
+        StarRocksISerializer serializer = csvSerializer(globals, Arrays.asList(
+                tableEntry(DATABASE, TABLE,
+                        "column_separator", "\\x01",
+                        "row_delimiter", "\\x02",
+                        "enclose", "'",
+                        "escape", "\\")));
+        assertEquals("'a\\'b'\u0001'c\\\\d'", serializer.serialize(new Object[]{"a'b", "c\\d"}));
+    }
+
+    @Test
+    public void testEntryOfThisTableThatOmitsAHeaderIsAcceptedWithoutMergeCommit() {
+        // Without merge commit the ordinary V2 loader starts from the sink level headers, so the
+        // entry keeps them and the bytes stay consistent with the load of this table.
+        Map<String, String> globals = props("column_separator", "\\x01", "enclose", "'", "escape", "\\");
+        StarRocksISerializer serializer = csvSerializer(globals, Arrays.asList(
+                tableEntry(DATABASE, TABLE, "timeout", "600")));
+        assertEquals("'a\\'b'\u0001'c\\\\d'", serializer.serialize(new Object[]{"a'b", "c\\d"}));
+    }
+
+    @Test
+    public void testMergeCommitWithoutAnEntryOfThisTableKeepsTheGlobalDialect() {
+        Map<String, String> globals = props(
+                "enable_merge_commit", "true",
+                "merge_commit_interval_ms", "1000",
+                "column_separator", "\\x01",
+                "enclose", "'");
+        // No entry at all: the sdk loads the default table properties, whose headers are the sink
+        // level ones, so the merge commit load parses with the dialect the serializer wrote.
+        assertEquals("'a''b'\u0001'1'",
+                csvSerializer(globals).serialize(new Object[]{"a'b", 1}));
+        // An entry registered for another table is not the entry of this table, so it is ignored.
+        assertEquals("'a''b'\u0001'1'", csvSerializer(globals, Arrays.asList(
+                tableEntry(DATABASE, "other_tbl", "enclose", "\""),
+                tableEntry("other_db", TABLE, "row_delimiter", "\\x03")))
+                .serialize(new Object[]{"a'b", 1}));
+    }
+
+    @Test
+    public void testMergeCommitEntryOfThisTableWithTheDefaultDialectIsAccepted() {
+        Map<String, String> globals = props("enable_merge_commit", "true", "merge_commit_interval_ms", "1000");
+        // With no dialect header set on the sink, an entry that leaves them out sends the server
+        // defaults, which are the defaults the serializer writes.
+        assertEquals("a\tb", csvSerializer(globals, Arrays.asList(tableEntry(DATABASE, TABLE)))
+                .serialize(new Object[]{"a", "b"}));
+        // Spelling a header as the value it defaults to agrees with the sink just the same.
+        assertEquals("a\tb", csvSerializer(globals, Arrays.asList(
+                tableEntry(DATABASE, TABLE, "row_delimiter", "\n", "escape", "")))
+                .serialize(new Object[]{"a", "b"}));
+    }
+
+    private void assertMergeCommitMissingHeaderRejected(String option, String sinkValue) {
+        Map<String, String> globals = props(
+                "enable_merge_commit", "true",
+                "merge_commit_interval_ms", "1000",
+                option, sinkValue);
+        try {
+            csvSerializer(globals, Arrays.asList(tableEntry(DATABASE, TABLE)));
+            fail("the `" + option + "` the entry of this table leaves out should have been rejected");
+        } catch (IllegalArgumentException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("`" + option + "`"));
+            assertTrue(e.getMessage(), e.getMessage().contains(DATABASE + "." + TABLE));
+        }
+    }
+
+    private static StreamLoadTableProperties tableEntry(String database, String table, String... keysAndValues) {
+        StreamLoadTableProperties.Builder builder = StreamLoadTableProperties.builder()
+                .database(database)
+                .table(table);
+        for (int i = 0; i < keysAndValues.length; i += 2) {
+            builder.addProperty(keysAndValues[i], keysAndValues[i + 1]);
+        }
+        return builder.build();
+    }
 }
