@@ -26,6 +26,7 @@ import org.apache.flink.util.Preconditions;
 import com.starrocks.connector.flink.manager.StarRocksSinkTable;
 import com.starrocks.connector.flink.row.sink.StarRocksDelimiterParser;
 import com.starrocks.data.load.stream.StreamLoadDataFormat;
+import com.starrocks.data.load.stream.StreamLoadUtils;
 import com.starrocks.data.load.stream.mergecommit.LoadParameters;
 import com.starrocks.data.load.stream.properties.StreamLoadProperties;
 import com.starrocks.data.load.stream.properties.StreamLoadTableProperties;
@@ -237,6 +238,10 @@ public class StarRocksSinkOptions implements Serializable {
     // wild stream load properties' prefix
     public static final String SINK_PROPERTIES_PREFIX = "sink.properties.";
     public static final String COLUMNS_KEY = "columns";
+
+    /** The csv headers that decide the dialect the server parses the loaded bytes with. */
+    private static final List<String> CSV_DIALECT_HEADERS =
+            Arrays.asList("column_separator", "row_delimiter", "enclose", "escape");
     /** Raised wherever the Flink schema is needed to derive the header and there is none. */
     public static final String COLUMNS_FROM_FLINK_SCHEMA_NEEDS_SCHEMA_MESSAGE =
             "sink.json.columns-from-flink-schema=true needs a Flink schema, which this sink does not have. "
@@ -782,6 +787,37 @@ public class StarRocksSinkOptions implements Serializable {
         return getDatabaseName() != null && getTableName() != null
                 && getDatabaseName().equals(tableProperties.getDatabase())
                 && getTableName().equals(tableProperties.getTable());
+    }
+
+    /**
+     * The csv dialect headers a registered override puts on the wire for this sink's own table,
+     * keyed by the lower case header name. Empty when no override for the table sets one.
+     *
+     * <p>Mirrors {@code StreamLoadProperties#getTableProperties}: the sdk keys overrides by unique
+     * key and the last registration wins. Nothing here queries the frontend.
+     */
+    public Map<String, String> getTableCsvDialectOverrides() {
+        Map<String, String> overrides = new HashMap<>();
+        if (getDatabaseName() == null || getTableName() == null) {
+            return overrides;
+        }
+        String uniqueKey = StreamLoadUtils.getTableUniqueKey(getDatabaseName(), getTableName());
+        StreamLoadTableProperties effective = null;
+        for (StreamLoadTableProperties tableProperties : tablePropertiesList) {
+            if (uniqueKey.equals(tableProperties.getUniqueKey())) {
+                effective = tableProperties;
+            }
+        }
+        if (effective == null) {
+            return overrides;
+        }
+        for (String header : CSV_DIALECT_HEADERS) {
+            String value = headerValue(effective, header);
+            if (value != null) {
+                overrides.put(header, value);
+            }
+        }
+        return overrides;
     }
 
     /**

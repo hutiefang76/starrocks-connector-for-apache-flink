@@ -17,12 +17,15 @@ package com.starrocks.connector.flink.row.sink;
 import com.starrocks.connector.flink.StarRocksSinkBaseTest;
 import com.starrocks.connector.flink.table.sink.StarRocksSinkOptions;
 import com.starrocks.connector.flink.tools.JsonWrapper;
+import com.starrocks.data.load.stream.properties.StreamLoadTableProperties;
 
 import org.junit.Test;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -177,8 +180,94 @@ public class StarRocksCsvSerializerTest extends StarRocksSinkBaseTest {
         }
     }
 
+    @Test
+    public void testDifferingSameTableOverrideOfTheDialectIsRejected() {
+        // The bytes carry the sink level dialect while a V2 sink asks the server to parse the table
+        // level one, so the two cannot be reconciled by the serializer.
+        assertDialectOverrideRejected("enclose", "\"", props("enclose", "'"));
+        assertDialectOverrideRejected("escape", "!", props("escape", "\\"));
+        assertDialectOverrideRejected("column_separator", "\\x02", props("column_separator", "\\x01"));
+        assertDialectOverrideRejected("row_delimiter", "\\x03", props("row_delimiter", "\\x02"));
+        // A sink without its own setting still writes the default dialect, which an override changes.
+        assertDialectOverrideRejected("enclose", "'", props());
+        assertDialectOverrideRejected("column_separator", ",", props());
+    }
+
+    @Test
+    public void testEquivalentSameTableOverrideIsAccepted() {
+        Map<String, String> globals = props("column_separator", "\\x01", "enclose", "'");
+        String expected = csvSerializer(globals).serialize(new Object[]{"a'b", 1});
+        // A hex separator, a separator spelled the way it is defaulted, a defaulted row delimiter and
+        // an empty escape all spell the dialect the serializer already writes.
+        StarRocksISerializer equivalent = csvSerializer(globals, Arrays.asList(
+                tableOverride(DATABASE, TABLE, "column_separator", "\\x01"),
+                tableOverride(DATABASE, TABLE, "row_delimiter", "\n"),
+                tableOverride(DATABASE, TABLE, "enclose", "'"),
+                tableOverride(DATABASE, TABLE, "escape", "")));
+        assertEquals(expected, equivalent.serialize(new Object[]{"a'b", 1}));
+    }
+
+    @Test
+    public void testOverrideForAnotherTableIsIgnored() {
+        StarRocksISerializer serializer = csvSerializer(props("enclose", "'"), Arrays.asList(
+                tableOverride(DATABASE, "other_tbl", "enclose", "\""),
+                tableOverride("other_db", TABLE, "enclose", "\"")));
+        assertEquals("'a''b'\t'1'", serializer.serialize(new Object[]{"a'b", 1}));
+    }
+
+    @Test
+    public void testLastRegisteredSameTableOverrideDecidesTheDialect() {
+        // The sdk keeps one entry per unique key, so only the last registration reaches the table.
+        StarRocksISerializer accepted = csvSerializer(props("enclose", "'"), Arrays.asList(
+                tableOverride(DATABASE, TABLE, "enclose", "\""),
+                tableOverride(DATABASE, TABLE, "enclose", "'")));
+        assertEquals("'a'", accepted.serialize(new Object[]{"a"}));
+
+        assertDialectOverrideRejected("enclose", "\"", props("enclose", "'"),
+                tableOverride(DATABASE, TABLE, "enclose", "'"));
+    }
+
+    @Test
+    public void testOverrideWithAnotherUniqueKeyIsIgnored() {
+        // The sdk looks an override up by the unique key of the table, so a foreign one never applies.
+        StarRocksISerializer serializer = csvSerializer(props("enclose", "'"), Arrays.asList(
+                StreamLoadTableProperties.builder()
+                        .uniqueKey("another-key")
+                        .database(DATABASE)
+                        .table(TABLE)
+                        .addProperty("enclose", "\"")
+                        .build()));
+        assertEquals("'a'", serializer.serialize(new Object[]{"a"}));
+    }
+
+    private void assertDialectOverrideRejected(String option, String overrideValue, Map<String, String> globals,
+                                               StreamLoadTableProperties... earlierOverrides) {
+        List<StreamLoadTableProperties> overrides = new ArrayList<>(Arrays.asList(earlierOverrides));
+        overrides.add(tableOverride(DATABASE, TABLE, option, overrideValue));
+        try {
+            csvSerializer(globals, overrides);
+            fail("the `" + option + "` override of this table should have been rejected");
+        } catch (IllegalArgumentException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("`" + option + "`"));
+            assertTrue(e.getMessage(), e.getMessage().contains(DATABASE + "." + TABLE));
+        }
+    }
+
+    private static StreamLoadTableProperties tableOverride(String database, String table, String option, String value) {
+        return StreamLoadTableProperties.builder()
+                .database(database)
+                .table(table)
+                .addProperty(option, value)
+                .build();
+    }
+
     /** Builds a serializer from its own options, so the shared OPTIONS of the base test is untouched. */
     private StarRocksISerializer csvSerializer(Map<String, String> streamLoadProperties) {
+        return csvSerializer(streamLoadProperties, Collections.emptyList());
+    }
+
+    private StarRocksISerializer csvSerializer(Map<String, String> streamLoadProperties,
+                                               List<StreamLoadTableProperties> tableProperties) {
         StarRocksSinkOptions.Builder builder = StarRocksSinkOptions.builder()
                 .withProperty("jdbc-url", JDBC_URL)
                 .withProperty("load-url", LOAD_URL)
@@ -187,8 +276,10 @@ public class StarRocksCsvSerializerTest extends StarRocksSinkBaseTest {
                 .withProperty("username", USERNAME)
                 .withProperty("password", PASSWORD);
         streamLoadProperties.forEach((key, value) -> builder.withProperty("sink.properties." + key, value));
+        StarRocksSinkOptions options = builder.build();
+        tableProperties.forEach(options::addTableProperties);
         StarRocksISerializer serializer =
-                StarRocksSerializerFactory.createSerializer(builder.build(), TABLE_SCHEMA.getFieldNames());
+                StarRocksSerializerFactory.createSerializer(options, TABLE_SCHEMA.getFieldNames());
         serializer.open(new StarRocksISerializer.SerializerContext(new JsonWrapper()));
         return serializer;
     }

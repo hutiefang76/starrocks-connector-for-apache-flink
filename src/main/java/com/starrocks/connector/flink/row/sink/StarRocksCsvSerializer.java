@@ -113,8 +113,9 @@ public class StarRocksCsvSerializer implements StarRocksISerializer {
         return field.startsWith(columnSeparator, index) || field.startsWith(rowDelimiter, index);
     }
 
-    // Unlike separators, the server reads enclose/escape as raw single-byte headers.
-    private static String singleByteOption(String value, String optionName) {
+    // Unlike separators, the server reads enclose/escape as raw single-byte headers. Package
+    // private because the serializer factory resolves an override's value the same way.
+    static String singleByteOption(String value, String optionName) {
         if (null == value || value.isEmpty()) {
             return null;
         }
