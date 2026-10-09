@@ -161,6 +161,16 @@ public class StreamLoadTableProperties implements Serializable {
             // The properties map holds the per table stream load headers, and nothing re-derives
             // them, so a copy that drops them would write the table differently.
             properties.putAll(streamLoadTableProperties.getProperties());
+            // build() re-derives the `columns` header from this builder's own columns field, and it
+            // only writes that entry when the field is non-null, so a generated entry copied here
+            // would survive an explicit columns(null) and keep loading the source table's columns.
+            // Drop the entry build() generated, which is the one equal to the source's columns
+            // field. Every other header is copied as is, a `columns` value the caller added as a raw
+            // property included, since build() never generates that one.
+            String sourceColumns = streamLoadTableProperties.getColumns();
+            if (sourceColumns != null && sourceColumns.equals(properties.get("columns"))) {
+                properties.remove("columns");
+            }
             commonProperties.putAll(streamLoadTableProperties.getCommonProperties());
             return this;
         }
