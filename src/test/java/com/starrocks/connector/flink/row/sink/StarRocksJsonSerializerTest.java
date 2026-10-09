@@ -15,20 +15,36 @@
 package com.starrocks.connector.flink.row.sink;
 
 import com.alibaba.fastjson.JSON;
+import com.alibaba.fastjson.JSONArray;
+import com.alibaba.fastjson.JSONObject;
 import com.starrocks.connector.flink.StarRocksSinkBaseTest;
 import com.starrocks.connector.flink.tools.JsonWrapper;
 import org.junit.Test;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.time.LocalDate;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
+
+import org.apache.flink.table.api.DataTypes;
+import org.apache.flink.table.api.TableSchema;
+import org.apache.flink.table.data.GenericArrayData;
+import org.apache.flink.table.data.GenericMapData;
+import org.apache.flink.table.data.GenericRowData;
+import org.apache.flink.table.data.MapData;
+import org.apache.flink.table.data.StringData;
+import org.apache.flink.table.runtime.typeutils.MapDataSerializer;
+import org.apache.flink.table.types.DataType;
 
 
 public class StarRocksJsonSerializerTest extends StarRocksSinkBaseTest {
@@ -56,5 +72,133 @@ public class StarRocksJsonSerializerTest extends StarRocksSinkBaseTest {
                 assertTrue(rMap.containsKey(name));
             }
         }
+    }
+
+    /**
+     * The keys and the values of the nested map should be serialized as the plain java types,
+     * so that the map keys are written as the field names of a json object, and the null value
+     * of a map/array must be serialized as the json null.
+     */
+    @Test
+    public void testNestedMapSerialize() {
+        OPTIONS.getSinkStreamLoadProperties().put("format", "json");
+
+        TableSchema schema = TableSchema.builder()
+            .field("m1", DataTypes.MAP(DataTypes.STRING(), DataTypes.ARRAY(DataTypes.STRING())))
+            .field("m3", DataTypes.MAP(DataTypes.STRING(), DataTypes.DATE()))
+            .field("m4", DataTypes.MAP(DataTypes.STRING(), DataTypes.STRING()))
+            .build();
+
+        GenericRowData rowData = new GenericRowData(schema.getFieldCount());
+        Map<Object, Object> m1 = new HashMap<>();
+        m1.put(StringData.fromString("a"), new GenericArrayData(new Object[]{StringData.fromString("x"), null}));
+        rowData.setField(0, new GenericMapData(m1));
+        Map<Object, Object> m3 = new HashMap<>();
+        m3.put(StringData.fromString("d"), (int) LocalDate.of(2021, 1, 2).toEpochDay());
+        rowData.setField(1, new GenericMapData(m3));
+        Map<Object, Object> m4 = new HashMap<>();
+        m4.put(StringData.fromString("s"), null);
+        rowData.setField(2, new GenericMapData(m4));
+
+        StarRocksTableRowTransformer rowTransformer = new StarRocksTableRowTransformer(null);
+        rowTransformer.setRuntimeContext(null);
+        rowTransformer.setTableSchema(schema);
+        StarRocksISerializer serializer = StarRocksSerializerFactory.createSerializer(OPTIONS, schema.getFieldNames());
+        serializer.open(new StarRocksISerializer.SerializerContext(new JsonWrapper()));
+
+        String result = serializer.serialize(rowTransformer.transform(rowData, false));
+        Map<String, Object> rMap = (Map<String, Object>)JSON.parse(result);
+        assertNotNull(rMap);
+        assertEquals("unexpected json: " + result, schema.getFieldCount(), rMap.size());
+
+        // the keys of a nested map must be serialized as the plain field names of a json object
+        JSONObject m1Json = (JSONObject) rMap.get("m1");
+        assertNotNull("unexpected json: " + result, m1Json);
+        JSONArray a = m1Json.getJSONArray("a");
+        assertNotNull("unexpected json: " + result, a);
+        assertEquals("x", a.getString(0));
+        // the null element of the nested array must be kept as a json null
+        assertEquals("unexpected json: " + result, 2, a.size());
+        assertNull("unexpected json: " + result, a.get(1));
+
+        // the date value of a nested map must be formatted as a string
+        JSONObject m3Json = (JSONObject) rMap.get("m3");
+        assertNotNull("unexpected json: " + result, m3Json);
+        assertEquals("unexpected json: " + result, "2021-01-02", m3Json.getString("d"));
+
+        // a null value of a nested map is omitted by the default fastjson features of JsonWrapper
+        JSONObject m4Json = (JSONObject) rMap.get("m4");
+        assertNotNull("unexpected json: " + result, m4Json);
+        assertEquals("unexpected json: " + result, 0, m4Json.size());
+    }
+
+    /**
+     * The binary representation of the nested map must be serialized to the same json as the
+     * generic representation: the keys of the map must be the plain field names of a json object,
+     * and the null values/elements must not break the serialization of the row.
+     */
+    @Test
+    public void testNestedBinaryMapSerialize() {
+        TableSchema schema = TableSchema.builder()
+            .field("m1", DataTypes.MAP(DataTypes.STRING(), DataTypes.ARRAY(DataTypes.STRING())))
+            .field("m3", DataTypes.MAP(DataTypes.STRING(), DataTypes.DATE()))
+            .field("m4", DataTypes.MAP(DataTypes.STRING(), DataTypes.STRING()))
+            .build();
+
+        GenericRowData rowData = new GenericRowData(schema.getFieldCount());
+        Map<Object, Object> m1 = new HashMap<>();
+        m1.put(StringData.fromString("a"), new GenericArrayData(new Object[]{StringData.fromString("x"), null}));
+        // the value of a map is allowed to be null even if its type is an array
+        m1.put(StringData.fromString("an"), null);
+        rowData.setField(0, toBinaryMap(m1, DataTypes.STRING(), DataTypes.ARRAY(DataTypes.STRING())));
+        Map<Object, Object> m3 = new HashMap<>();
+        m3.put(StringData.fromString("d"), (int) LocalDate.of(2021, 1, 2).toEpochDay());
+        rowData.setField(1, toBinaryMap(m3, DataTypes.STRING(), DataTypes.DATE()));
+        Map<Object, Object> m4 = new HashMap<>();
+        m4.put(StringData.fromString("s"), null);
+        rowData.setField(2, toBinaryMap(m4, DataTypes.STRING(), DataTypes.STRING()));
+
+        String result = serializeRow(schema, rowData);
+        Map<String, Object> rMap = (Map<String, Object>)JSON.parse(result);
+        assertNotNull(rMap);
+        assertEquals("unexpected json: " + result, schema.getFieldCount(), rMap.size());
+
+        // the keys of a binary nested map must be serialized as the plain field names of a json object
+        JSONObject m1Json = (JSONObject) rMap.get("m1");
+        assertNotNull("unexpected json: " + result, m1Json);
+        JSONArray a = m1Json.getJSONArray("a");
+        assertNotNull("unexpected json: " + result, a);
+        assertEquals("unexpected json: " + result, "x", a.getString(0));
+        // the null element of the nested array must be kept as a json null
+        assertEquals("unexpected json: " + result, 2, a.size());
+        assertNull("unexpected json: " + result, a.get(1));
+        // a null value whose type is an array is omitted by the default fastjson features of JsonWrapper
+        assertEquals("unexpected json: " + result, 1, m1Json.size());
+        assertFalse("unexpected json: " + result, m1Json.containsKey("an"));
+
+        // the date value of a binary nested map must be formatted as a string
+        JSONObject m3Json = (JSONObject) rMap.get("m3");
+        assertNotNull("unexpected json: " + result, m3Json);
+        assertEquals("unexpected json: " + result, "2021-01-02", m3Json.getString("d"));
+
+        // a null value of a binary nested map is omitted by the default fastjson features of JsonWrapper
+        JSONObject m4Json = (JSONObject) rMap.get("m4");
+        assertNotNull("unexpected json: " + result, m4Json);
+        assertEquals("unexpected json: " + result, 0, m4Json.size());
+    }
+
+    private static MapData toBinaryMap(Map<Object, Object> map, DataType keyType, DataType valueType) {
+        return new MapDataSerializer(keyType.getLogicalType(), valueType.getLogicalType())
+            .toBinaryMap(new GenericMapData(map));
+    }
+
+    private String serializeRow(TableSchema schema, GenericRowData rowData) {
+        OPTIONS.getSinkStreamLoadProperties().put("format", "json");
+        StarRocksTableRowTransformer rowTransformer = new StarRocksTableRowTransformer(null);
+        rowTransformer.setRuntimeContext(null);
+        rowTransformer.setTableSchema(schema);
+        StarRocksISerializer serializer = StarRocksSerializerFactory.createSerializer(OPTIONS, schema.getFieldNames());
+        serializer.open(new StarRocksISerializer.SerializerContext(new JsonWrapper()));
+        return serializer.serialize(rowTransformer.transform(rowData, false));
     }
 }

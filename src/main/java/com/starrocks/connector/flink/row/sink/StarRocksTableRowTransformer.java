@@ -23,11 +23,9 @@ import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.table.api.TableSchema;
 import org.apache.flink.table.data.ArrayData;
 import org.apache.flink.table.data.GenericArrayData;
-import org.apache.flink.table.data.GenericMapData;
 import org.apache.flink.table.data.MapData;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.data.binary.BinaryArrayData;
-import org.apache.flink.table.data.binary.BinaryMapData;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.logical.ArrayType;
 import org.apache.flink.table.types.logical.DecimalType;
@@ -195,6 +193,10 @@ public class StarRocksTableRowTransformer implements StarRocksIRowTransformer<Ro
                 RowType rType = (RowType)lt;
                 // parse nested row data
                 return data.parallelStream().map(row -> {
+                    if (null == row) {
+                        // the null element of the nested array must be kept as null
+                        return null;
+                    }
                     Map<String, Object> m = Maps.newHashMap();
                     rType.getFields().parallelStream().forEach(f -> m.put(f.getName(), typeConvertion(f.getType(), (RowData)row, rType.getFieldIndex(f.getName()))));
                     return jsonWrapper.toJSONString(m);
@@ -202,14 +204,14 @@ public class StarRocksTableRowTransformer implements StarRocksIRowTransformer<Ro
             }
             if (LogicalTypeRoot.MAP.equals(lt.getTypeRoot())) {
                 // traversal of the nested map
-                return data.parallelStream().map(m -> convertNestedMap((MapData)m, lt)).collect(Collectors.toList());
+                return data.parallelStream().map(m -> null == m ? null : convertNestedMap((MapData)m, lt)).collect(Collectors.toList());
             }
             if (LogicalTypeRoot.DATE.equals(lt.getTypeRoot())) {
-                return data.parallelStream().map(date -> dateFormatter.format(Date.valueOf(LocalDate.ofEpochDay((Integer)date)))).collect(Collectors.toList());
+                return data.parallelStream().map(date -> null == date ? null : dateFormatter.format(Date.valueOf(LocalDate.ofEpochDay((Integer)date)))).collect(Collectors.toList());
             }
             if (LogicalTypeRoot.ARRAY.equals(lt.getTypeRoot())) {
                 // traversal of the nested array
-                return data.parallelStream().map(arr -> convertNestedArray((ArrayData)arr, lt)).collect(Collectors.toList());
+                return data.parallelStream().map(arr -> null == arr ? null : convertNestedArray((ArrayData)arr, lt)).collect(Collectors.toList());
             }
             return data;
         }
@@ -217,36 +219,51 @@ public class StarRocksTableRowTransformer implements StarRocksIRowTransformer<Ro
     }
 
     private Map<Object, Object> convertNestedMap(MapData mapData, LogicalType type) {
-        if (mapData instanceof GenericMapData) {
-            HashMap<Object, Object> m = Maps.newHashMap();
-            for (Object k : ((GenericArrayData)((GenericMapData)mapData).keyArray()).toObjectArray()) {
-                m.put(k, ((GenericMapData)mapData).get(k));
-            }
-            return m;
+        LogicalType keyType = ((MapType)type).getKeyType();
+        LogicalType valueType = ((MapType)type).getValueType();
+        ArrayData keyArray = mapData.keyArray();
+        ArrayData valueArray = mapData.valueArray();
+        Map<Object, Object> result = Maps.newHashMap();
+        for (int i = 0; i < mapData.size(); i++) {
+            // the value of a map is allowed to be null, and the null value must be kept as null
+            // instead of being traversed as a nested map/array
+            result.put(convertNestedElement(keyArray, i, keyType), convertNestedElement(valueArray, i, valueType));
         }
-        if (mapData instanceof BinaryMapData) {
-            Map<Object, Object> result = Maps.newHashMap();
-            LogicalType valType = ((MapType)type).getValueType();
-            Map<?, ?> javaMap = ((BinaryMapData)mapData).toJavaMap(((MapType)type).getKeyType(), valType);
-            for (Map.Entry<?,?> en : javaMap.entrySet()) {
-                if (LogicalTypeRoot.MAP.equals(valType.getTypeRoot())) {
-                    // traversal of the nested map
-                    result.put(en.getKey().toString(), convertNestedMap((MapData)en.getValue(), valType));
-                    continue;
-                }
-                if (LogicalTypeRoot.DATE.equals(valType.getTypeRoot())) {
-                    result.put(en.getKey().toString(), dateFormatter.format(Date.valueOf(LocalDate.ofEpochDay((Integer)en.getValue()))));
-                    continue;
-                }
-                if (LogicalTypeRoot.ARRAY.equals(valType.getTypeRoot())) {
-                    result.put(en.getKey().toString(), convertNestedArray((ArrayData)en.getValue(), valType));
-                    continue;
-                }
-                result.put(en.getKey().toString(), en.getValue());
-            }
-            return result;
+        return result;
+    }
+
+    /**
+     * Convert a single element of a nested map or array, the element is converted to a plain
+     * java object according to its logical type, and a null element is kept as null. It is needed
+     * because the internal types like StringData can not be serialized correctly here: the keys
+     * of a map are serialized by the global serialize config of fastjson, and the values of a map
+     * would be passed to the json serializer as they are.
+     */
+    private Object convertNestedElement(ArrayData arrayData, int pos, LogicalType type) {
+        if (arrayData.isNullAt(pos)) {
+            return null;
         }
-        throw new UnsupportedOperationException(String.format("Unsupported map data: %s", mapData.getClass()));
+        switch (type.getTypeRoot()) {
+            case CHAR:
+            case VARCHAR:
+                return arrayData.getString(pos).toString();
+            case DATE:
+                return dateFormatter.format(Date.valueOf(LocalDate.ofEpochDay(arrayData.getInt(pos))));
+            case MAP:
+                return convertNestedMap(arrayData.getMap(pos), type);
+            case ARRAY:
+                return convertNestedArray(arrayData.getArray(pos), type);
+            case ROW:
+                RowType rType = (RowType)type;
+                RowData row = arrayData.getRow(pos, rType.getFieldCount());
+                Map<String, Object> m = new HashMap<>();
+                for (RowType.RowField field : rType.getFields()) {
+                    m.put(field.getName(), typeConvertion(field.getType(), row, rType.getFieldIndex(field.getName())));
+                }
+                return m;
+            default:
+                return ArrayData.createElementGetter(type).getElementOrNull(arrayData, pos);
+        }
     }
     
 }
