@@ -29,6 +29,7 @@ import static org.junit.Assert.assertTrue;
 import java.math.BigDecimal;
 import java.sql.Timestamp;
 import java.time.LocalDate;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -80,6 +81,30 @@ public class StarRocksTableRowTransformerTest extends StarRocksSinkBaseTest {
         .field("mdt", DataTypes.MAP(DataTypes.DATE(), DataTypes.STRING()))
         .field("mts", DataTypes.MAP(DataTypes.TIMESTAMP(3), DataTypes.STRING()))
         .build();
+
+    private static final byte[] BINARY_MAP_KEY = new byte[]{0x01, 0x02, 0x03};
+
+    /**
+     * The contents of {@link #BINARY_MAP_KEY} read as an unsigned big-endian number: the numeric
+     * representation which the top level BINARY column uses.
+     */
+    private static final long BINARY_MAP_KEY_NUMBER = 66051L;
+
+    private static final TableSchema BINARY_KEY_SCHEMA = TableSchema.builder()
+        .field("b", DataTypes.BINARY(BINARY_MAP_KEY.length))
+        .field("mb", DataTypes.MAP(DataTypes.BINARY(BINARY_MAP_KEY.length), DataTypes.STRING()))
+        .build();
+
+    private static final DataType DATE_MAP_TYPE = DataTypes.MAP(DataTypes.DATE(), DataTypes.DATE());
+
+    private static final TableSchema DATE_MAP_ARRAY_SCHEMA = TableSchema.builder()
+        .field("am", DataTypes.ARRAY(DATE_MAP_TYPE))
+        .build();
+
+    /** Enough elements/dates to convert the elements of the array concurrently. */
+    private static final int PARALLEL_DATE_ELEMENTS = 240;
+
+    private static final int PARALLEL_DATES_PER_ELEMENT = 4;
 
     private static final TableSchema NESTED_ROW_VALUE_SCHEMA = TableSchema.builder()
         .field("m", DataTypes.MAP(DataTypes.STRING(), NESTED_MAP_ROW_TYPE))
@@ -286,6 +311,111 @@ public class StarRocksTableRowTransformerTest extends StarRocksSinkBaseTest {
         assertTrue("unexpected key: " + key, key instanceof String);
         assertEquals("v", map.get(key));
         return (String) key;
+    }
+
+    /**
+     * The key of a map is the field name of a json object, so a binary key must be written as a
+     * quoted string: the numeric representation of the binary value is used, like the top level
+     * binary column.
+     */
+    @Test
+    public void testBinaryMapKeyTransformer() {
+        assertBinaryMapKeys(createTransformer(BINARY_KEY_SCHEMA, StarRocksDataType.JSON)
+            .transform(createBinaryMapKeyRowData(false), false));
+        assertBinaryMapKeys(createTransformer(BINARY_KEY_SCHEMA, StarRocksDataType.JSON)
+            .transform(createBinaryMapKeyRowData(true), false));
+    }
+
+    private GenericRowData createBinaryMapKeyRowData(boolean binary) {
+        GenericRowData rowData = new GenericRowData(BINARY_KEY_SCHEMA.getFieldCount());
+        rowData.setField(0, BINARY_MAP_KEY.clone());
+
+        Map<Object, Object> mb = new HashMap<>();
+        mb.put(BINARY_MAP_KEY, StringData.fromString("v"));
+        mb.put(new byte[]{0x01, 0x02, 0x04}, StringData.fromString("v"));
+        mb.put(new byte[]{0x01, 0x02, (byte) 0xFF}, StringData.fromString("v"));
+        rowData.setField(1, binary
+            ? toBinaryMap(mb, BINARY_KEY_SCHEMA.getFieldDataTypes()[1])
+            : new GenericMapData(mb));
+
+        return rowData;
+    }
+
+    @SuppressWarnings("unchecked")
+    private void assertBinaryMapKeys(Object[] values) {
+        // the top level binary column is written as its numeric representation
+        Object b = values[0];
+        assertTrue("unexpected value: " + b, b instanceof Number);
+        assertEquals(BINARY_MAP_KEY_NUMBER, ((Number) b).longValue());
+
+        // the keys of a map are the field names of a json object, so they must be strings even if
+        // the key type is a binary type
+        Map<Object, Object> mb = (Map<Object, Object>) values[1];
+        assertEquals(3, mb.size());
+        assertTrue("unexpected keys: " + mb.keySet(), mb.containsKey("66051"));
+        assertTrue("unexpected keys: " + mb.keySet(), mb.containsKey("66052"));
+        assertTrue("unexpected keys: " + mb.keySet(), mb.containsKey("66303"));
+        for (Object key : mb.keySet()) {
+            assertTrue("unexpected key: " + key, key instanceof String);
+            assertEquals("v", String.valueOf(mb.get(key)));
+        }
+    }
+
+    /**
+     * The date values of the maps of a binary array must be formatted as strings: the elements of
+     * the array are converted concurrently, so every date must be formatted independently, and a
+     * null date value must be kept as null instead of being formatted.
+     */
+    @Test
+    @SuppressWarnings("unchecked")
+    public void testArrayDateMapTransformer() {
+        StarRocksTableRowTransformer rowTransformer =
+            createTransformer(DATE_MAP_ARRAY_SCHEMA, StarRocksDataType.JSON);
+
+        Object[] mapElements = new Object[PARALLEL_DATE_ELEMENTS];
+        List<List<String>> expectedDates = new ArrayList<>(PARALLEL_DATE_ELEMENTS);
+        for (int i = 0; i < PARALLEL_DATE_ELEMENTS; i++) {
+            Map<Object, Object> map = new HashMap<>();
+            List<String> dates = new ArrayList<>(PARALLEL_DATES_PER_ELEMENT + 1);
+            for (int j = 0; j < PARALLEL_DATES_PER_ELEMENT; j++) {
+                // an independent date for every element and position, used as the key and the
+                // value of the map
+                LocalDate date = LocalDate.ofEpochDay(i * (PARALLEL_DATES_PER_ELEMENT + 1) + j + 1);
+                dates.add(date.toString());
+                map.put((int) date.toEpochDay(), (int) date.toEpochDay());
+            }
+            // a null date value must be kept as null instead of being formatted
+            LocalDate nullDate = LocalDate.ofEpochDay(0);
+            dates.add(nullDate.toString());
+            map.put((int) nullDate.toEpochDay(), null);
+            expectedDates.add(dates);
+            mapElements[i] = toBinaryMap(map, DATE_MAP_TYPE);
+        }
+
+        ArrayData arrayData = new ArrayDataSerializer(DATE_MAP_TYPE.getLogicalType())
+            .toBinaryArray(new GenericArrayData(mapElements));
+        GenericRowData rowData = new GenericRowData(DATE_MAP_ARRAY_SCHEMA.getFieldCount());
+        rowData.setField(0, arrayData);
+
+        List<Object> elements = (List<Object>) rowTransformer.transform(rowData, false)[0];
+        assertEquals(PARALLEL_DATE_ELEMENTS, elements.size());
+        for (int i = 0; i < PARALLEL_DATE_ELEMENTS; i++) {
+            Map<Object, Object> map = (Map<Object, Object>) elements.get(i);
+            assertNotNull("unexpected element: " + i, map);
+            List<String> dates = expectedDates.get(i);
+            assertEquals("unexpected element: " + i, dates.size(), map.size());
+            for (int j = 0; j < dates.size(); j++) {
+                String date = dates.get(j);
+                assertTrue("unexpected keys: " + map.keySet(), map.containsKey(date));
+                if (j == PARALLEL_DATES_PER_ELEMENT) {
+                    // the null date value must be kept as null
+                    assertNull("unexpected value of " + date, map.get(date));
+                } else {
+                    // the date value must be formatted independently as LocalDate.toString()
+                    assertEquals("unexpected value of " + date, date, String.valueOf(map.get(date)));
+                }
+            }
+        }
     }
 
     /**

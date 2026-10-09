@@ -204,13 +204,14 @@ public class StarRocksJsonSerializerTest extends StarRocksSinkBaseTest {
             .field("md", DataTypes.MAP(DataTypes.DECIMAL(10, 2), DataTypes.STRING()))
             .field("mdt", DataTypes.MAP(DataTypes.DATE(), DataTypes.STRING()))
             .field("mts", DataTypes.MAP(DataTypes.TIMESTAMP(3), DataTypes.STRING()))
+            .field("mb", DataTypes.MAP(DataTypes.BINARY(3), DataTypes.STRING()))
             .build();
         assertNonStringMapKeyJson(schema, createNonStringMapKeyRowData(false));
         assertNonStringMapKeyJson(schema, createNonStringMapKeyRowData(true));
     }
 
     private GenericRowData createNonStringMapKeyRowData(boolean binary) {
-        GenericRowData rowData = new GenericRowData(4);
+        GenericRowData rowData = new GenericRowData(5);
 
         Map<Object, Object> mi = new HashMap<>();
         mi.put(1, StringData.fromString("v"));
@@ -233,6 +234,11 @@ public class StarRocksJsonSerializerTest extends StarRocksSinkBaseTest {
         rowData.setField(3, binary
             ? toBinaryMap(mts, DataTypes.TIMESTAMP(3), DataTypes.STRING()) : new GenericMapData(mts));
 
+        Map<Object, Object> mb = new HashMap<>();
+        mb.put(new byte[]{0x01, 0x02, 0x03}, StringData.fromString("v"));
+        rowData.setField(4, binary
+            ? toBinaryMap(mb, DataTypes.BINARY(3), DataTypes.STRING()) : new GenericMapData(mb));
+
         return rowData;
     }
 
@@ -242,12 +248,16 @@ public class StarRocksJsonSerializerTest extends StarRocksSinkBaseTest {
         // a non-string key which is not converted to a string is written without quotes
         assertFalse("unexpected json: " + result, result.contains("{1:"));
         assertTrue("unexpected json: " + result, result.contains("\"mi\":{\"1\":\"v\"}"));
+        // a binary key which is not converted to a string is written as an object id
+        assertFalse("unexpected json: " + result, result.contains("[B@"));
+        assertTrue("unexpected json: " + result, result.contains("\"mb\":{\"66051\":\"v\"}"));
 
         Map<String, Object> rMap = (Map<String, Object>)JSON.parse(result);
         assertEquals("unexpected json: " + result, "v", mapValue(rMap.get("mi"), "1"));
         assertEquals("unexpected json: " + result, "v", mapValue(rMap.get("md"), "1.50"));
         assertEquals("unexpected json: " + result, "v", mapValue(rMap.get("mdt"), "2021-01-02"));
         assertEquals("unexpected json: " + result, "v", mapValue(rMap.get("mts"), "2021-01-02T03:04:05.006"));
+        assertEquals("unexpected json: " + result, "v", mapValue(rMap.get("mb"), "66051"));
     }
 
     private String mapValue(Object map, String key) {

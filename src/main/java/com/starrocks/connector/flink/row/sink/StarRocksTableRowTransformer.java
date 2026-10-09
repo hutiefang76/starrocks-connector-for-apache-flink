@@ -36,9 +36,8 @@ import org.apache.flink.table.types.logical.MapType;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.table.types.logical.TimestampType;
 
-import java.sql.Date;
-import java.text.SimpleDateFormat;
 import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -49,12 +48,19 @@ public class StarRocksTableRowTransformer implements StarRocksIRowTransformer<Ro
 
     private static final long serialVersionUID = 1L;
 
+    /**
+     * The date of a nested element/key is formatted with this immutable formatter because the
+     * nested elements of an array are converted in parallel, and a shared mutable
+     * SimpleDateFormat would let concurrent conversions format another element's date. The
+     * pattern keeps the date format of the values unchanged.
+     */
+    private static final DateTimeFormatter DATE_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd");
+
     private TypeInformation<RowData> rowDataTypeInfo;
     private Function<RowData, RowData> valueTransform;
     private String[] columnNames;
     private DataType[] columnDataTypes;
     private Map<String, StarRocksDataType> columns;
-    private final SimpleDateFormat dateFormatter = new SimpleDateFormat("yyyy-MM-dd");
 
     private transient JsonWrapper jsonWrapper;
 
@@ -150,7 +156,7 @@ public class StarRocksTableRowTransformer implements StarRocksIRowTransformer<Ro
                 }
                 return sValue;
             case DATE:
-                return dateFormatter.format(Date.valueOf(LocalDate.ofEpochDay(record.getInt(pos))));
+                return formatDate(record.getInt(pos));
             case TIMESTAMP_WITHOUT_TIME_ZONE:
                 final int timestampPrecision =((TimestampType) type).getPrecision();
                 return record.getTimestamp(pos, timestampPrecision).toLocalDateTime().toString();
@@ -162,12 +168,7 @@ public class StarRocksTableRowTransformer implements StarRocksIRowTransformer<Ro
                 final int decimalScale = ((DecimalType) type).getScale();
                 return record.getDecimal(pos, decimalPrecision, decimalScale).toBigDecimal();
             case BINARY:
-                final byte[] bts = record.getBinary(pos);
-                long value = 0;
-                for (int i = 0; i < bts.length; i++) {
-                    value += (bts[bts.length - i - 1] & 0xffL) << (8 * i);
-                }
-                return value;
+                return binaryToNumber(record.getBinary(pos));
             case ARRAY:
                 return convertNestedArray(record.getArray(pos), type);
             case MAP:
@@ -212,7 +213,7 @@ public class StarRocksTableRowTransformer implements StarRocksIRowTransformer<Ro
                 return data.parallelStream().map(m -> null == m ? null : convertNestedMap((MapData)m, lt)).collect(Collectors.toList());
             }
             if (LogicalTypeRoot.DATE.equals(lt.getTypeRoot())) {
-                return data.parallelStream().map(date -> null == date ? null : dateFormatter.format(Date.valueOf(LocalDate.ofEpochDay((Integer)date)))).collect(Collectors.toList());
+                return data.parallelStream().map(date -> null == date ? null : formatDate((Integer)date)).collect(Collectors.toList());
             }
             if (LogicalTypeRoot.ARRAY.equals(lt.getTypeRoot())) {
                 // traversal of the nested array
@@ -252,7 +253,12 @@ public class StarRocksTableRowTransformer implements StarRocksIRowTransformer<Ro
             case VARCHAR:
                 return keyArray.getString(pos).toString();
             case DATE:
-                return dateFormatter.format(Date.valueOf(LocalDate.ofEpochDay(keyArray.getInt(pos))));
+                return formatDate(keyArray.getInt(pos));
+            case BINARY:
+                // the key is encoded from the contents of the bytes, in the same numeric
+                // representation as the top level BINARY column; the identity of the byte array
+                // would give an unstable key like `[B@3d...`
+                return String.valueOf(binaryToNumber(keyArray.getBinary(pos)));
             case DECIMAL:
                 final DecimalType keyDecimalType = (DecimalType) keyType;
                 return keyArray.getDecimal(pos, keyDecimalType.getPrecision(), keyDecimalType.getScale())
@@ -283,7 +289,7 @@ public class StarRocksTableRowTransformer implements StarRocksIRowTransformer<Ro
             case VARCHAR:
                 return arrayData.getString(pos).toString();
             case DATE:
-                return dateFormatter.format(Date.valueOf(LocalDate.ofEpochDay(arrayData.getInt(pos))));
+                return formatDate(arrayData.getInt(pos));
             case MAP:
                 return convertNestedMap(arrayData.getMap(pos), type);
             case ARRAY:
@@ -307,6 +313,27 @@ public class StarRocksTableRowTransformer implements StarRocksIRowTransformer<Ro
             m.put(field.getName(), typeConvertion(field.getType(), row, rowType.getFieldIndex(field.getName()), false));
         }
         return m;
+    }
+
+    /**
+     * Format the date of the given epoch day, thread-safely: the nested elements of an array are
+     * converted in parallel, so the formatter must not keep any mutable state.
+     */
+    private static String formatDate(int epochDay) {
+        return DATE_FORMATTER.format(LocalDate.ofEpochDay(epochDay));
+    }
+
+    /**
+     * Convert the contents of a binary value to its numeric representation, which is the one of
+     * the top level BINARY column: the bytes are read as an unsigned big-endian number. A binary
+     * map key must be derived from the contents of its bytes instead of the identity of the array.
+     */
+    private static long binaryToNumber(byte[] bytes) {
+        long value = 0;
+        for (int i = 0; i < bytes.length; i++) {
+            value += (bytes[bytes.length - i - 1] & 0xffL) << (8 * i);
+        }
+        return value;
     }
     
 }
