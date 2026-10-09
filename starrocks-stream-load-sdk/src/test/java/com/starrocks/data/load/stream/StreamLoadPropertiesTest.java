@@ -23,6 +23,8 @@ import com.starrocks.data.load.stream.properties.StreamLoadTableProperties;
 import org.junit.Test;
 
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -330,5 +332,161 @@ public class StreamLoadPropertiesTest {
 
         assertNull(copy.getColumns());
         assertEquals("`a`,`b`", copy.getProperty("columns").orElse(null));
+    }
+    // HTTP header names are case insensitive, so a `Columns` header copied from the source and the
+    // `columns` header build() derives from the destination's columns field are one header, sent
+    // twice. The explicit destination field is the one that must survive.
+    @Test
+    public void testCopyFromDropsCopiedMixedCaseColumnsHeaderWhenTheFieldIsSet() {
+        StreamLoadTableProperties source = StreamLoadTableProperties.builder()
+                .database("db")
+                .table("src")
+                .addProperty("Columns", "`a`,`b`")
+                .build();
+        assertNull(source.getColumns());
+        assertEquals("`a`,`b`", source.getProperties().get("Columns"));
+
+        StreamLoadTableProperties copy = StreamLoadTableProperties.builder()
+                .copyFrom(source)
+                .database("db2")
+                .table("t2")
+                .columns("`c`")
+                .build();
+
+        assertEquals("`c`", copy.getColumns());
+        assertEquals("`c`", copy.getProperty("columns").orElse(null));
+        assertFalse(copy.getProperties().containsKey("Columns"));
+        assertEquals(1, countIgnoreCase(copy.getProperties(), "columns"));
+    }
+
+    // The same holds for db and table, whose fields build() always derives from: a copy sent to
+    // another table must not carry the source's spelling of them.
+    @Test
+    public void testCopyFromDropsCopiedMixedCaseDbTableHeadersWhenTheFieldsChange() {
+        StreamLoadTableProperties source = StreamLoadTableProperties.builder()
+                .database("db")
+                .table("src")
+                .addProperty("DB", "stale_db")
+                .addProperty("Table", "stale_table")
+                .build();
+
+        StreamLoadTableProperties copy = StreamLoadTableProperties.builder()
+                .copyFrom(source)
+                .database("db2")
+                .table("t2")
+                .build();
+
+        assertEquals("db2", copy.getDatabase());
+        assertEquals("t2", copy.getTable());
+        assertEquals("db2", copy.getProperty("db").orElse(null));
+        assertEquals("t2", copy.getProperty("table").orElse(null));
+        assertFalse(copy.getProperties().containsKey("DB"));
+        assertFalse(copy.getProperties().containsKey("Table"));
+        assertEquals(1, countIgnoreCase(copy.getProperties(), "db"));
+        assertEquals(1, countIgnoreCase(copy.getProperties(), "table"));
+    }
+
+    // LoadParameters puts the common map on the wire before the per table map, so a reserved header
+    // left in the common map would also reach the server next to the derived per table one.
+    @Test
+    public void testCopyFromDropsCopiedMixedCaseReservedHeadersFromTheCommonMap() {
+        Map<String, String> common = new HashMap<>();
+        common.put("COLUMNS", "`a`,`b`");
+        common.put("DB", "stale_db");
+        common.put("TABLE", "stale_table");
+        common.put("Warehouse", "wh1");
+        StreamLoadTableProperties source = StreamLoadTableProperties.builder()
+                .database("db")
+                .table("src")
+                .addCommonProperties(common)
+                .build();
+        assertEquals("`a`,`b`", source.getCommonProperties().get("COLUMNS"));
+
+        StreamLoadTableProperties copy = StreamLoadTableProperties.builder()
+                .copyFrom(source)
+                .database("db2")
+                .table("t2")
+                .columns("`c`")
+                .build();
+
+        assertFalse(copy.getCommonProperties().containsKey("COLUMNS"));
+        assertFalse(copy.getCommonProperties().containsKey("DB"));
+        assertFalse(copy.getCommonProperties().containsKey("TABLE"));
+        // A header the destination does not derive keeps the caller's spelling.
+        assertEquals("wh1", copy.getCommonProperties().get("Warehouse"));
+
+        Map<String, String> headers = mergedHeaders(copy);
+        assertEquals("`c`", headers.get("columns"));
+        assertEquals("db2", headers.get("db"));
+        assertEquals("t2", headers.get("table"));
+        assertEquals(1, countIgnoreCase(headers, "columns"));
+        assertEquals(1, countIgnoreCase(headers, "db"));
+        assertEquals(1, countIgnoreCase(headers, "table"));
+    }
+
+    // Nothing is derived when the destination leaves the columns field null, so a raw `Columns`
+    // header survives the copy whatever its spelling.
+    @Test
+    public void testCopyFromKeepsRawMixedCaseColumnsPropertyWhenTheFieldIsNull() {
+        StreamLoadTableProperties source = StreamLoadTableProperties.builder()
+                .database("db")
+                .table("src")
+                .addProperty("Columns", "`x`,`y`")
+                .addProperty("max_filter_ratio", "0.1")
+                .build();
+        assertNull(source.getColumns());
+
+        StreamLoadTableProperties copy = StreamLoadTableProperties.builder()
+                .copyFrom(source)
+                .database("db2")
+                .table("t2")
+                .columns(null)
+                .build();
+
+        assertNull(copy.getColumns());
+        assertEquals("`x`,`y`", copy.getProperties().get("Columns"));
+        assertEquals(1, countIgnoreCase(copy.getProperties(), "columns"));
+        assertEquals("0.1", copy.getProperty("max_filter_ratio").orElse(null));
+        assertEquals("db2", copy.getProperty("db").orElse(null));
+        assertEquals("t2", copy.getProperty("table").orElse(null));
+    }
+
+    @Test
+    public void testCopyFromKeepsRawMixedCaseColumnsCommonPropertyWhenTheFieldIsNull() {
+        StreamLoadTableProperties source = StreamLoadTableProperties.builder()
+                .database("db")
+                .table("src")
+                .addCommonProperties(Collections.singletonMap("COLUMNS", "`x`,`y`"))
+                .build();
+
+        StreamLoadTableProperties copy = StreamLoadTableProperties.builder()
+                .copyFrom(source)
+                .database("db2")
+                .table("t2")
+                .columns(null)
+                .build();
+
+        assertNull(copy.getColumns());
+        assertEquals("`x`,`y`", copy.getCommonProperties().get("COLUMNS"));
+        assertFalse(copy.getProperties().containsKey("columns"));
+        assertEquals(1, countIgnoreCase(copy.getCommonProperties(), "columns"));
+    }
+
+    private static int countIgnoreCase(Map<String, String> properties, String name) {
+        int count = 0;
+        for (String key : properties.keySet()) {
+            if (name.equalsIgnoreCase(key)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    // Mirrors what LoadParameters does before the headers reach the wire: the common map first, then
+    // the per table map, so the per table entry wins a name both maps carry.
+    private static Map<String, String> mergedHeaders(StreamLoadTableProperties properties) {
+        Map<String, String> headers = new HashMap<>(properties.getCommonProperties());
+        headers.putAll(properties.getProperties());
+        return headers;
     }
 }

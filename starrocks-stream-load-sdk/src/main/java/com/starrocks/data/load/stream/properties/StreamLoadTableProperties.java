@@ -166,7 +166,9 @@ public class StreamLoadTableProperties implements Serializable {
             // would survive an explicit columns(null) and keep loading the source table's columns.
             // Drop the entry build() generated, which is the one equal to the source's columns
             // field. Every other header is copied as is, a `columns` value the caller added as a raw
-            // property included, since build() never generates that one.
+            // property included, since build() never generates that one. build() drops the case
+            // variants of the names it derives when it writes its own, so the copy is left with one
+            // header per reserved name.
             String sourceColumns = streamLoadTableProperties.getColumns();
             if (sourceColumns != null && sourceColumns.equals(properties.get("columns"))) {
                 properties.remove("columns");
@@ -240,12 +242,33 @@ public class StreamLoadTableProperties implements Serializable {
                 throw new IllegalArgumentException(String.format("database `%s` or table `%s` can't be null", database, table));
             }
 
+            // db, table and columns are the headers this builder derives from its own fields, and
+            // HTTP header names are case insensitive: a caller supplied `DB` next to the derived
+            // `db` is the same header sent twice, and the server may read either value. The derived
+            // field is the explicit destination, so it wins: the conflicting reserved names are
+            // dropped whatever their case before the derived ones are written. db and table are
+            // always derived, columns only when the field is set, so a raw `columns` property, which
+            // the wildcard default relies on, still survives a build that leaves that field null.
+            // Only these three reserved names are touched, every other header keeps its spelling.
+            removeReservedProperty("db");
+            removeReservedProperty("table");
+            if (columns != null) {
+                removeReservedProperty("columns");
+            }
             addProperty("db", database);
             addProperty("table", table);
             if (columns != null) {
                 addProperty("columns", columns);
             }
             return new StreamLoadTableProperties(this);
+        }
+
+        // HTTP header names are case insensitive, so `Columns` and `columns` are one header. Both
+        // maps are cleared because LoadParameters merges the common map before the per table map,
+        // which would put a mixed case common entry on the wire next to the derived per table one.
+        private void removeReservedProperty(String name) {
+            properties.keySet().removeIf(key -> name.equalsIgnoreCase(key));
+            commonProperties.keySet().removeIf(key -> name.equalsIgnoreCase(key));
         }
 
     }
