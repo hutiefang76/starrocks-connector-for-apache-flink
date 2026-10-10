@@ -843,6 +843,23 @@ public class StarRocksSinkOptions implements Serializable {
                 entry = candidate;
             }
         }
+        if (entry == null) {
+            return null;
+        }
+        // Mirrors {@code StreamLoadProperties#getTableProperties}: the sdk looks the entry up by unique
+        // key and, when its database and table differ from the requested ones, remaps it onto the table
+        // with {@code copyFrom}. copyFrom carries neither the unique key nor the per table headers, so
+        // those headers are dropped for the load. The key is `database + "-" + table`, so the names can
+        // differ while the key matches: `a-b`.`c` and `a`.`b-c` both key to `a-b-c`. Reading the raw
+        // entry here would report a dialect the load never sends, so reproduce the remap. copyFrom
+        // builds a new entry, so the registered one is left untouched.
+        if (!getDatabaseName().equals(entry.getDatabase()) || !getTableName().equals(entry.getTable())) {
+            return StreamLoadTableProperties.builder()
+                    .copyFrom(entry)
+                    .database(getDatabaseName())
+                    .table(getTableName())
+                    .build();
+        }
         return entry;
     }
 

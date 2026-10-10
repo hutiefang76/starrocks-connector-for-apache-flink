@@ -240,6 +240,47 @@ public class StarRocksCsvSerializerTest extends StarRocksSinkBaseTest {
         assertEquals("'a'", serializer.serialize(new Object[]{"a"}));
     }
 
+    @Test
+    public void testCollidingUniqueKeyRemapDropsTheEntryDialectUnderMergeCommit() {
+        // The sdk unique key is `database + "-" + table`, so `a-b`.`c` and `a`.`b-c` both key to
+        // `a-b-c`: the entry registered for `a-b`.`c` is what the sdk looks up for this sink's table
+        // `a`.`b-c`. Because the names differ the sdk remaps it with copyFrom, which drops the per
+        // table headers, so its `enclose` never reaches the load. Merge commit then sends no `enclose`
+        // and the server parses the bytes with its own default, while the serializer writes the sink
+        // level one: the registration must not be read as if it applied to this table unchanged.
+        Map<String, String> globals = props(
+                "enable_merge_commit", "true",
+                "merge_commit_interval_ms", "1000",
+                "enclose", "'");
+        try {
+            csvSerializer("a", "b-c", globals, Arrays.asList(tableEntry("a-b", "c", "enclose", "'")));
+            fail("the remapped entry loses `enclose`, which the merge commit load should have rejected");
+        } catch (IllegalArgumentException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("`enclose`"));
+            assertTrue(e.getMessage(), e.getMessage().contains("a.b-c"));
+        }
+    }
+
+    @Test
+    public void testCollidingUniqueKeyRemapIsIgnoredWithoutMergeCommit() {
+        // Without merge commit the ordinary V2 loader starts from the sink level headers, which the
+        // remap left alone, so this table keeps the sink dialect even though the colliding entry sets
+        // another `enclose`: that header was dropped by the remap and never applies here.
+        StarRocksISerializer serializer = csvSerializer("a", "b-c", props("enclose", "'"),
+                Arrays.asList(tableEntry("a-b", "c", "enclose", "\"")));
+        assertEquals("'a'", serializer.serialize(new Object[]{"a"}));
+    }
+
+    @Test
+    public void testCollidingUniqueKeyRemapOfANonDialectEntryIsAccepted() {
+        // The same collision with an entry that sets no dialect header: dropping it leaves the default
+        // dialect the serializer already writes, so the ordinary default case still goes through.
+        Map<String, String> globals = props("column_separator", "\\x01", "enclose", "'");
+        StarRocksISerializer serializer = csvSerializer("a", "b-c", globals,
+                Arrays.asList(tableEntry("a-b", "c", "timeout", "600")));
+        assertEquals("'a''b'\u0001'1'", serializer.serialize(new Object[]{"a'b", 1}));
+    }
+
     private void assertDialectOverrideRejected(String option, String overrideValue, Map<String, String> globals,
                                                StreamLoadTableProperties... earlierOverrides) {
         List<StreamLoadTableProperties> overrides = new ArrayList<>(Arrays.asList(earlierOverrides));
@@ -268,11 +309,17 @@ public class StarRocksCsvSerializerTest extends StarRocksSinkBaseTest {
 
     private StarRocksISerializer csvSerializer(Map<String, String> streamLoadProperties,
                                                List<StreamLoadTableProperties> tableProperties) {
+        return csvSerializer(DATABASE, TABLE, streamLoadProperties, tableProperties);
+    }
+
+    private StarRocksISerializer csvSerializer(String database, String table,
+                                               Map<String, String> streamLoadProperties,
+                                               List<StreamLoadTableProperties> tableProperties) {
         StarRocksSinkOptions.Builder builder = StarRocksSinkOptions.builder()
                 .withProperty("jdbc-url", JDBC_URL)
                 .withProperty("load-url", LOAD_URL)
-                .withProperty("database-name", DATABASE)
-                .withProperty("table-name", TABLE)
+                .withProperty("database-name", database)
+                .withProperty("table-name", table)
                 .withProperty("username", USERNAME)
                 .withProperty("password", PASSWORD);
         streamLoadProperties.forEach((key, value) -> builder.withProperty("sink.properties." + key, value));
