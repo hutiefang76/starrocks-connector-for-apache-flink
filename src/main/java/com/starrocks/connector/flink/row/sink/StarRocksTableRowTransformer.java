@@ -192,7 +192,17 @@ public class StarRocksTableRowTransformer implements StarRocksIRowTransformer<Ro
 
     private List<Object> convertNestedArray(ArrayData arrData, LogicalType type) {
         if (arrData instanceof GenericArrayData) {
-            return Lists.newArrayList(((GenericArrayData)arrData).toObjectArray());
+            // The generic representation keeps the internal objects of the elements, so every
+            // element must be converted recursively according to the logical type of the element
+            // of the array: a nested array, map, row or date would otherwise remain an internal
+            // object which can not be serialized.
+            LogicalType elementType = ((ArrayType) type).getElementType();
+            Object[] elements = ((GenericArrayData) arrData).toObjectArray();
+            List<Object> data = Lists.newArrayList();
+            for (Object element : elements) {
+                data.add(convertGenericArrayElement(element, elementType));
+            }
+            return data;
         }
         if (arrData instanceof BinaryArrayData) {
             LogicalType lt = ((ArrayType)type).getElementType();
@@ -222,6 +232,33 @@ public class StarRocksTableRowTransformer implements StarRocksIRowTransformer<Ro
             return data;
         }
         throw new UnsupportedOperationException(String.format("Unsupported array data: %s", arrData.getClass()));
+    }
+
+    /**
+     * Convert a single element of a generic array according to the logical type of the element.
+     * A nested array, map, row or date is kept as an internal object by the generic
+     * representation and would not be serialized correctly, so it is converted recursively like
+     * the element of a binary array. The scalar elements are kept as they are, and a null
+     * element is kept as null. A row element is serialized as a json string, like the element of
+     * a binary array of rows, and the keys of a map element are normalized to strings by the map
+     * helper, like the key of a binary map.
+     */
+    private Object convertGenericArrayElement(Object element, LogicalType elementType) {
+        if (element == null) {
+            return null;
+        }
+        switch (elementType.getTypeRoot()) {
+            case DATE:
+                return formatDate((Integer) element);
+            case MAP:
+                return convertNestedMap((MapData) element, elementType);
+            case ARRAY:
+                return convertNestedArray((ArrayData) element, elementType);
+            case ROW:
+                return jsonWrapper.toJSONString(convertNestedRow((RowData) element, (RowType) elementType));
+            default:
+                return element;
+        }
     }
 
     private Map<Object, Object> convertNestedMap(MapData mapData, LogicalType type) {
@@ -255,10 +292,10 @@ public class StarRocksTableRowTransformer implements StarRocksIRowTransformer<Ro
             case DATE:
                 return formatDate(keyArray.getInt(pos));
             case BINARY:
-                // the key is encoded from the contents of the bytes, in the same numeric
-                // representation as the top level BINARY column; the identity of the byte array
-                // would give an unstable key like `[B@3d...`
-                return String.valueOf(binaryToNumber(keyArray.getBinary(pos)));
+                // the key is encoded from the contents of the bytes, in the same representation
+                // as the top level BINARY column; the identity of the byte array would give an
+                // unstable key like `[B@3d...`
+                return binaryMapKey(keyArray.getBinary(pos));
             case DECIMAL:
                 final DecimalType keyDecimalType = (DecimalType) keyType;
                 return keyArray.getDecimal(pos, keyDecimalType.getPrecision(), keyDecimalType.getScale())
@@ -334,6 +371,26 @@ public class StarRocksTableRowTransformer implements StarRocksIRowTransformer<Ro
             value += (bytes[bytes.length - i - 1] & 0xffL) << (8 * i);
         }
         return value;
+    }
+
+    /**
+     * Encode the contents of a binary map key. A key which fits into a long keeps the numeric
+     * representation of the top level BINARY column, unchanged. A key which is longer than 8
+     * bytes can not be represented by a long: its bytes would be shifted out and two different
+     * keys would collide, so the full contents are encoded as a hexadecimal string with a prefix
+     * which distinguishes it from the numeric representation of a short key.
+     */
+    private static String binaryMapKey(byte[] bytes) {
+        if (bytes.length <= Long.BYTES) {
+            return String.valueOf(binaryToNumber(bytes));
+        }
+        StringBuilder builder = new StringBuilder(2 + bytes.length * 2);
+        builder.append("0x");
+        for (byte b : bytes) {
+            builder.append(Character.forDigit((b >> 4) & 0xf, 16));
+            builder.append(Character.forDigit(b & 0xf, 16));
+        }
+        return builder.toString();
     }
     
 }

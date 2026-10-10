@@ -514,6 +514,177 @@ public class StarRocksTableRowTransformerTest extends StarRocksSinkBaseTest {
         assertEquals("{\"x\":1}", values[2]);
     }
 
+    private static final LocalDate GENERIC_ARRAY_DATE_1 = LocalDate.of(2021, 5, 6);
+
+    private static final LocalDate GENERIC_ARRAY_DATE_2 = LocalDate.of(2021, 5, 7);
+
+    /**
+     * Two keys longer than 8 bytes which collide in the numeric representation of the top level
+     * binary column: the first byte of the first key and the last byte of the second key are
+     * shifted into the same low byte, so both would be read as the number 1. The full contents of
+     * the bytes must be part of the key.
+     */
+    private static final byte[] LONG_BINARY_MAP_KEY_1 =
+        new byte[]{0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+    private static final byte[] LONG_BINARY_MAP_KEY_2 =
+        new byte[]{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01};
+
+    private static final TableSchema LONG_BINARY_KEY_SCHEMA = TableSchema.builder()
+        .field("mb", DataTypes.MAP(DataTypes.BINARY(LONG_BINARY_MAP_KEY_1.length), DataTypes.STRING()))
+        .build();
+
+    private static final DataType STRING_MAP_TYPE = DataTypes.MAP(DataTypes.STRING(), DataTypes.STRING());
+
+    private static final TableSchema GENERIC_ARRAY_SCHEMA = TableSchema.builder()
+        .field("ad", DataTypes.ARRAY(DataTypes.DATE()))
+        .field("am", DataTypes.ARRAY(STRING_MAP_TYPE))
+        .field("ar", DataTypes.ARRAY(NESTED_MAP_ROW_TYPE))
+        .build();
+
+    /**
+     * The keys of two different binary values longer than 8 bytes must not collide: the full
+     * contents of the bytes are encoded, and the serialized json object keeps both entries.
+     */
+    @Test
+    @SuppressWarnings("unchecked")
+    public void testLongBinaryMapKeyTransformer() {
+        StarRocksTableRowTransformer rowTransformer =
+            createTransformer(LONG_BINARY_KEY_SCHEMA, StarRocksDataType.JSON);
+
+        Map<Object, Object> mb = new HashMap<>();
+        mb.put(LONG_BINARY_MAP_KEY_1, StringData.fromString("v1"));
+        mb.put(LONG_BINARY_MAP_KEY_2, StringData.fromString("v2"));
+        GenericRowData rowData = new GenericRowData(LONG_BINARY_KEY_SCHEMA.getFieldCount());
+        rowData.setField(0, new GenericMapData(mb));
+
+        Map<Object, Object> keys = (Map<Object, Object>) rowTransformer.transform(rowData, false)[0];
+        assertEquals(2, keys.size());
+        // the two keys collide in the numeric representation, so both must be encoded with their
+        // full contents and kept apart
+        String key1 = "0x010000000000000000";
+        String key2 = "0x000000000000000001";
+        assertTrue("unexpected keys: " + keys.keySet(), keys.containsKey(key1));
+        assertTrue("unexpected keys: " + keys.keySet(), keys.containsKey(key2));
+        assertEquals("v1", String.valueOf(keys.get(key1)));
+        assertEquals("v2", String.valueOf(keys.get(key2)));
+
+        // the two keys survive a real serialization of the payload
+        JSONObject payload = JSON.parseObject(JSON.toJSONString(keys));
+        assertEquals(2, payload.size());
+        assertEquals("v1", payload.getString(key1));
+        assertEquals("v2", payload.getString(key2));
+    }
+
+    /**
+     * The elements of a generic array must be converted recursively according to the logical
+     * type of the element, like the elements of a binary array, and a null element must be kept
+     * as null.
+     */
+    @Test
+    @SuppressWarnings("unchecked")
+    public void testGenericArrayLogicalElementTransformer() {
+        StarRocksTableRowTransformer rowTransformer =
+            createTransformer(GENERIC_ARRAY_SCHEMA, StarRocksDataType.JSON);
+
+        Map<Object, Object> nestedMap = new HashMap<>();
+        nestedMap.put(StringData.fromString("k"), StringData.fromString("v"));
+
+        GenericRowData rowData = new GenericRowData(GENERIC_ARRAY_SCHEMA.getFieldCount());
+        rowData.setField(0, new GenericArrayData(new Object[]{
+            (int) GENERIC_ARRAY_DATE_1.toEpochDay(), null, (int) GENERIC_ARRAY_DATE_2.toEpochDay()}));
+        rowData.setField(1, new GenericArrayData(new Object[]{new GenericMapData(nestedMap), null}));
+        rowData.setField(2, new GenericArrayData(new Object[]{createNestedRow(), null}));
+
+        Object[] values = rowTransformer.transform(rowData, false);
+
+        List<Object> dates = (List<Object>) values[0];
+        assertEquals(3, dates.size());
+        assertEquals(GENERIC_ARRAY_DATE_1.toString(), dates.get(0));
+        assertNull(dates.get(1));
+        assertEquals(GENERIC_ARRAY_DATE_2.toString(), dates.get(2));
+
+        List<Object> maps = (List<Object>) values[1];
+        assertEquals(2, maps.size());
+        Map<Object, Object> map = (Map<Object, Object>) maps.get(0);
+        assertNotNull(map);
+        assertEquals("v", map.get("k"));
+        assertNull(maps.get(1));
+
+        List<Object> rows = (List<Object>) values[2];
+        assertEquals(2, rows.size());
+        // the row element is serialized as a json string, like the element of a binary array
+        assertTrue("unexpected element: " + rows.get(0), rows.get(0) instanceof String);
+        JSONObject rowJson = JSON.parseObject((String) rows.get(0));
+        assertEquals(7, rowJson.getIntValue("a"));
+        assertEquals("{\"x\":1}", rowJson.get("b"));
+        assertNull(rows.get(1));
+    }
+
+    /**
+     * The generic and the binary representation of the same array of dates must be converted in
+     * the same way.
+     */
+    @Test
+    @SuppressWarnings("unchecked")
+    public void testGenericAndBinaryArrayEquivalenceTransformer() {
+        StarRocksTableRowTransformer rowTransformer =
+            createTransformer(GENERIC_ARRAY_SCHEMA, StarRocksDataType.JSON);
+
+        Object[] elements = new Object[]{
+            (int) GENERIC_ARRAY_DATE_1.toEpochDay(), null, (int) GENERIC_ARRAY_DATE_2.toEpochDay()};
+
+        GenericRowData genericRowData = new GenericRowData(GENERIC_ARRAY_SCHEMA.getFieldCount());
+        genericRowData.setField(0, new GenericArrayData(elements));
+
+        GenericRowData binaryRowData = new GenericRowData(GENERIC_ARRAY_SCHEMA.getFieldCount());
+        binaryRowData.setField(0, new ArrayDataSerializer(DataTypes.DATE().getLogicalType())
+            .toBinaryArray(new GenericArrayData(elements)));
+
+        assertEquals(
+            (List<Object>) rowTransformer.transform(genericRowData, false)[0],
+            (List<Object>) rowTransformer.transform(binaryRowData, false)[0]);
+    }
+
+    /**
+     * The generic and the binary representation of the same array of maps and rows must be
+     * converted in the same way: the payload of both representations must be identical, the key
+     * of a generic map must be normalized to a string like the key of a binary map, and the row
+     * element of both must be serialized as a json string.
+     */
+    @Test
+    @SuppressWarnings("unchecked")
+    public void testGenericAndBinaryArrayRowEquivalenceTransformer() {
+        StarRocksTableRowTransformer rowTransformer =
+            createTransformer(GENERIC_ARRAY_SCHEMA, StarRocksDataType.JSON);
+
+        Map<Object, Object> nestedMap = new HashMap<>();
+        nestedMap.put(StringData.fromString("k"), StringData.fromString("v"));
+        Object[] mapElements = new Object[]{new GenericMapData(nestedMap), null};
+        Object[] rowElements = new Object[]{createNestedRow(), null};
+
+        GenericRowData genericRowData = new GenericRowData(GENERIC_ARRAY_SCHEMA.getFieldCount());
+        genericRowData.setField(1, new GenericArrayData(mapElements));
+        genericRowData.setField(2, new GenericArrayData(rowElements));
+
+        GenericRowData binaryRowData = new GenericRowData(GENERIC_ARRAY_SCHEMA.getFieldCount());
+        binaryRowData.setField(1, new ArrayDataSerializer(STRING_MAP_TYPE.getLogicalType())
+            .toBinaryArray(new GenericArrayData(new Object[]{toBinaryMap(nestedMap, STRING_MAP_TYPE), null})));
+        binaryRowData.setField(2, new ArrayDataSerializer(NESTED_MAP_ROW_TYPE.getLogicalType())
+            .toBinaryArray(new GenericArrayData(rowElements)));
+
+        Object[] genericValues = rowTransformer.transform(genericRowData, false);
+        Object[] binaryValues = rowTransformer.transform(binaryRowData, false);
+        assertEquals(binaryValues[1], genericValues[1]);
+        assertEquals(binaryValues[2], genericValues[2]);
+        Map<Object, Object> map = (Map<Object, Object>) ((List<Object>) genericValues[1]).get(0);
+        assertTrue("unexpected key: " + map.keySet(), map.containsKey("k"));
+        assertEquals("v", String.valueOf(map.get("k")));
+        List<Object> rows = (List<Object>) genericValues[2];
+        assertTrue("unexpected element: " + rows.get(0), rows.get(0) instanceof String);
+        assertNull(rows.get(1));
+    }
+
     private StarRocksTableRowTransformer createTransformer(TableSchema schema, StarRocksDataType columnType) {
         StarRocksTableRowTransformer rowTransformer = new StarRocksTableRowTransformer(null);
         rowTransformer.setRuntimeContext(null);
