@@ -821,8 +821,14 @@ public class StarRocksSinkOptions implements Serializable {
                 }
                 continue;
             }
-            // With an entry the headers of the table come from that entry alone.
-            String value = headerValue(entry, header);
+            // The merge commit loader builds the headers of the table from that entry alone, so both
+            // of its maps count, see `LoadParameters#getParameters`. The ordinary V2 loader starts
+            // from the sink level headers and reads the per table map only, so the common map of the
+            // entry is ignored: a dialect header set there never reaches the server and the sink
+            // level value keeps applying.
+            String value = mergeCommit
+                    ? headerValue(entry, header)
+                    : lookupIgnoreCase(entry.getProperties(), header);
             if (value != null) {
                 registered.put(header, value);
                 load.put(header, value);

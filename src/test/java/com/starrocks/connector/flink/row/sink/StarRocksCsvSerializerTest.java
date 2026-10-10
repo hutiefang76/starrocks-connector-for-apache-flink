@@ -409,6 +409,38 @@ public class StarRocksCsvSerializerTest extends StarRocksSinkBaseTest {
                 .serialize(new Object[]{"a", "b"}));
     }
 
+    @Test
+    public void testOrdinaryV2IgnoresTheCommonMapOfTheEntryOfThisTable() {
+        // The ordinary V2 loader starts from the sink level headers and reads the per table map only,
+        // so a dialect header the entry sets through its common map never reaches the load: the sink
+        // level value the serializer wrote is what the server parses with, so a common value that
+        // disagrees with the sink level one is accepted here even though merge commit would reject it.
+        Map<String, String> globals = props("enclose", "'", "escape", "\\");
+        StarRocksISerializer serializer = csvSerializer(globals, Arrays.asList(
+                tableCommonEntry(DATABASE, TABLE, "enclose", "\"", "escape", "!")));
+        assertEquals("'a\\'b'", serializer.serialize(new Object[]{"a'b"}));
+    }
+
+    @Test
+    public void testMergeCommitEntryOfThisTableThatMismatchesAGlobalDialectHeaderInItsCommonMapIsRejected() {
+        // Merge commit builds the headers of a table from that table's own maps alone, so a dialect
+        // header the entry sets through its common map counts exactly like one set through the per
+        // table map: a value that disagrees with the sink level one is a dialect the server would
+        // parse differently from the serializer, so it must be rejected.
+        Map<String, String> globals = props(
+                "enable_merge_commit", "true",
+                "merge_commit_interval_ms", "1000",
+                "enclose", "'");
+        try {
+            csvSerializer(globals, Arrays.asList(
+                    tableCommonEntry(DATABASE, TABLE, "enclose", "\"")));
+            fail("the `enclose` the common map of the entry of this table sets should have been rejected");
+        } catch (IllegalArgumentException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("`enclose`"));
+            assertTrue(e.getMessage(), e.getMessage().contains(DATABASE + "." + TABLE));
+        }
+    }
+
     private void assertMergeCommitMissingHeaderRejected(String option, String sinkValue) {
         Map<String, String> globals = props(
                 "enable_merge_commit", "true",
@@ -431,5 +463,14 @@ public class StarRocksCsvSerializerTest extends StarRocksSinkBaseTest {
             builder.addProperty(keysAndValues[i], keysAndValues[i + 1]);
         }
         return builder.build();
+    }
+
+    private static StreamLoadTableProperties tableCommonEntry(String database, String table,
+                                                              String... keysAndValues) {
+        return StreamLoadTableProperties.builder()
+                .database(database)
+                .table(table)
+                .addCommonProperties(props(keysAndValues))
+                .build();
     }
 }
